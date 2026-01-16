@@ -39,7 +39,7 @@ class Config:
         return value
 
     # ── Authentication ───────────────────────────────────────────────
-    LOGIN_NICK     = get("DD_LOGIN_NICK",     required=True)
+    LOGIN_NICK     = get("DD_LOGIN_EMAIL",     required=True)
     LOGIN_PASS     = get("DD_LOGIN_PASS",     required=True)
     COOKIE_FILE    = get("DD_COOKIE_FILE",    str(BASE_DIR / "damadam_cookies.pkl"))
 
