@@ -1,11 +1,7 @@
 """
-DamaDam Bot V2.0.0 - Complete Refactored Version (Updated Jan 2026)
-Organized, Clean, and Modular Architecture
-
-Modes:
-  --mode msg       : Send personal messages (Phase 1)
-  --mode post      : Create new posts (Phase 2) 
-  --mode inbox     : Monitor & reply to inbox (Phase 3)
+DamaDam Bot v2.0.1
+POST MODE (TEST VERSION)
+GitHub Actions Compatible
 """
 
 import time
@@ -16,269 +12,232 @@ import pickle
 import argparse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional, Dict, List
+
 import gspread
 from google.oauth2.service_account import Credentials
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
-from gspread.exceptions import WorksheetNotFound
+from selenium.common.exceptions import TimeoutException
+
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.service import Service
+
 from rich.console import Console
-from rich.table import Table
 
 console = Console()
 
 # ============================================================================
-# CONFIGURATION (same as before)
+# CONFIG
 # ============================================================================
 
-VERSION = "2.0.1"  # updated version
 BASE_URL = "https://damadam.pk"
+VERSION = "2.0.1"
 
 class Config:
-    """Centralized Configuration"""
-    
-    LOGIN_EMAIL = os.getenv("DD_LOGIN_EMAIL", "0utLawZ")
-    LOGIN_PASS = os.getenv("DD_LOGIN_PASS", "asdasd")
-    COOKIE_FILE = os.getenv("COOKIE_FILE", "damadam_cookies.pkl")
-    
-    SHEET_ID = os.getenv("DD_SHEET_ID", "1xph0dra5-wPcgMXKubQD7A2CokObpst7o2rWbDA10t8")
-    PROFILES_SHEET_ID = os.getenv("DD_PROFILES_SHEET_ID", "16t-D8dCXFvheHEpncoQ_VnXQKkrEREAup7c1ZLFXvu0")
-    CREDENTIALS_FILE = os.getenv("CREDENTIALS_FILE", "credentials.json")
-    
-    CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "chromedriver.exe")
-    
+    LOGIN_EMAIL = os.getenv("DD_LOGIN_EMAIL")
+    LOGIN_PASS  = os.getenv("DD_LOGIN_PASS")
+
+    SHEET_ID = os.getenv("DD_SHEET_ID")
+    CREDENTIALS_FILE = "credentials.json"
+
+    COOKIE_FILE = "cookies.pkl"
+
+    MAX_POST_PAGES = int(os.getenv("DD_MAX_POST_PAGES", "3"))
     DEBUG = os.getenv("DD_DEBUG", "0") == "1"
-    MAX_PROFILES = int(os.getenv("DD_MAX_PROFILES", "0"))
-    MAX_POST_PAGES = int(os.getenv("DD_MAX_POST_PAGES", "4"))
-    AUTO_PUSH = os.getenv("DD_AUTO_PUSH", "0") == "1"
-    
-    LOG_DIR = Path("logs")
-    LOG_DIR.mkdir(exist_ok=True)
 
 # ============================================================================
-# LOGGING SYSTEM (same)
+# LOGGER
 # ============================================================================
 
 class Logger:
-    def __init__(self, mode: str = "general"):
-        self.mode = mode
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_file = Config.LOG_DIR / f"{mode}_{timestamp}.log"
-        
-    def log(self, message: str, level: str = "INFO"):
-        pkt_time = self._get_pkt_time()
-        timestamp = pkt_time.strftime("%H:%M:%S")
-        
-        color_map = {
-            "INFO": "white",
-            "SUCCESS": "green",
-            "WARNING": "yellow",
-            "ERROR": "red",
-            "DEBUG": "blue"
-        }
-        color = color_map.get(level, "white")
-        console.print(f"[{timestamp}] [{level}] {message}", style=color)
-        
-        with open(self.log_file, "a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] [{level}] {message}\n")
-    
-    def info(self, msg): self.log(msg, "INFO")
-    def success(self, msg): self.log(msg, "SUCCESS")
-    def warning(self, msg): self.log(msg, "WARNING")
-    def error(self, msg): self.log(msg, "ERROR")
-    def debug(self, msg): 
-        if Config.DEBUG:
-            self.log(msg, "DEBUG")
-    
-    @staticmethod
-    def _get_pkt_time():
-        return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=5)
+    def log(self, msg, level="INFO"):
+        ts = datetime.utcnow().strftime("%H:%M:%S")
+        console.print(f"[{ts}] [{level}] {msg}")
+
+    def info(self, m): self.log(m, "INFO")
+    def success(self, m): self.log(m, "SUCCESS")
+    def warning(self, m): self.log(m, "WARNING")
+    def error(self, m): self.log(m, "ERROR")
+
+logger = Logger()
 
 # ============================================================================
-# BROWSER MANAGER - Updated with better anti-detection & fallback selectors
+# BROWSER
 # ============================================================================
 
 class BrowserManager:
-    def __init__(self, logger: Logger):
-        self.logger = logger
+    def __init__(self):
         self.driver = None
-        
-    def setup(self) -> Optional[webdriver.Chrome]:
-        try:
-            opts = Options()
-            opts.add_argument("--headless=new")
-            opts.add_argument("--window-size=1920,1080")
-            opts.add_argument("--disable-blink-features=AutomationControlled")
-            opts.add_argument("--no-sandbox")
-            opts.add_argument("--disable-dev-shm-usage")
-            opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-            opts.add_experimental_option('excludeSwitches', ['enable-automation'])
-            opts.add_experimental_option('useAutomationExtension', False)
-            opts.page_load_strategy = "eager"
-            
-            if Config.CHROMEDRIVER_PATH and os.path.exists(Config.CHROMEDRIVER_PATH):
-                self.driver = webdriver.Chrome(service=Service(Config.CHROMEDRIVER_PATH), options=opts)
-            else:
-                self.driver = webdriver.Chrome(options=opts)
-                
-            self.driver.set_page_load_timeout(60)  # increased
-            self.driver.execute_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
-            self.logger.success("Browser setup complete")
-            return self.driver
-        except Exception as e:
-            self.logger.error(f"Browser setup failed: {e}")
-            return None
-    
+
+    def setup(self):
+        opts = Options()
+        opts.add_argument("--headless=new")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--window-size=1920,1080")
+
+        self.driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=opts
+        )
+        self.driver.set_page_load_timeout(40)
+        logger.success("Browser ready")
+        return self.driver
+
     def login(self) -> bool:
-        if not self.driver:
-            return False
-            
-        try:
-            # Try cookies first
-            if self._load_cookies():
-                self.driver.get(BASE_URL)
-                time.sleep(3)
-                if 'login' not in self.driver.current_url.lower():
-                    self.logger.success("Logged in via cookies")
-                    return True
-            
-            # Fresh login with fallback selectors
-            self.driver.get(f"{BASE_URL}/login/")
-            time.sleep(5)  # increased wait
-            
-            wait = WebDriverWait(self.driver, 15)
-            
-            # Nickname / Username field - multiple fallbacks
-            nick_selectors = [
-                (By.CSS_SELECTOR, "#nick, input[name='nick']"),
-                (By.NAME, "nick"),
-                (By.NAME, "username"),
-                (By.CSS_SELECTOR, "input[type='text'][autocomplete='username']"),
-                (By.CSS_SELECTOR, "input[placeholder*='nick' i], input[placeholder*='user' i]")
-            ]
-            
-            nick = None
-            for by, value in nick_selectors:
-                try:
-                    nick = wait.until(EC.presence_of_element_located((by, value)))
-                    self.logger.success(f"Nick field mila using: {value}")
-                    break
-                except:
-                    continue
-            
-            if not nick:
-                self.driver.save_screenshot("login_nick_fail.png")
-                self.logger.error("Nickname field nahi mila - debug screenshot save ho gaya")
-                return False
-            
-            # Password field fallbacks
-            pw_selectors = [
-                (By.CSS_SELECTOR, "#pass, input[name='pass']"),
-                (By.NAME, "pass"),
-                (By.NAME, "password"),
-                (By.CSS_SELECTOR, "input[type='password']")
-            ]
-            
-            pw = None
-            for by, value in pw_selectors:
-                try:
-                    pw = self.driver.find_element(by, value)
-                    break
-                except:
-                    continue
-            
-            if not pw:
-                self.logger.error("Password field nahi mila")
-                return False
-            
-            # Submit button fallbacks
-            btn_selectors = [
-                (By.CSS_SELECTOR, "button[type='submit']"),
-                (By.CSS_SELECTOR, "button.btn, button.btn-primary"),
-                (By.XPATH, "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'login')]"),
-                (By.CSS_SELECTOR, "input[type='submit']")
-            ]
-            
-            btn = None
-            for by, value in btn_selectors:
-                try:
-                    btn = self.driver.find_element(by, value)
-                    break
-                except:
-                    continue
-            
-            if not btn:
-                self.logger.error("Submit button nahi mila")
-                return False
-            
-            # Fill and submit
-            nick.clear()
-            nick.send_keys(Config.LOGIN_EMAIL)
-            time.sleep(0.7)
-            
-            pw.clear()
-            pw.send_keys(Config.LOGIN_PASS)
-            time.sleep(0.7)
-            
-            btn.click()
-            time.sleep(6)
-            
-            if 'login' not in self.driver.current_url.lower():
-                self._save_cookies()
-                self.logger.success("Login successful")
-                return True
-            
-            self.logger.error("Login failed - wrong credentials ya page change?")
-            return False
-            
-        except Exception as e:
-            self.logger.error(f"Login error: {e}")
-            return False
-    
-    def _save_cookies(self):
-        try:
-            with open(Config.COOKIE_FILE, 'wb') as f:
-                pickle.dump(self.driver.get_cookies(), f)
-            self.logger.success("Cookies saved")
-        except Exception as e:
-            self.logger.warning(f"Cookie save failed: {e}")
-    
-    def _load_cookies(self) -> bool:
-        try:
-            if not os.path.exists(Config.COOKIE_FILE):
-                return False
-            
-            self.driver.get(BASE_URL)
-            time.sleep(3)
-            
-            with open(Config.COOKIE_FILE, 'rb') as f:
-                cookies = pickle.load(f)
-            
-            for c in cookies:
-                try:
+        self.driver.get(BASE_URL)
+        time.sleep(2)
+
+        # Try cookies
+        if os.path.exists(Config.COOKIE_FILE):
+            try:
+                with open(Config.COOKIE_FILE, "rb") as f:
+                    cookies = pickle.load(f)
+                for c in cookies:
                     self.driver.add_cookie(c)
-                except:
-                    pass
-            
-            self.driver.refresh()
-            time.sleep(3)
-            return True
-        except:
-            return False
-    
+                self.driver.refresh()
+                time.sleep(2)
+                if "login" not in self.driver.current_url.lower():
+                    logger.success("Login via cookies")
+                    return True
+            except:
+                pass
+
+        # Fresh login
+        logger.info("Fresh login")
+        self.driver.get(f"{BASE_URL}/login/")
+        time.sleep(3)
+
+        try:
+            nick = self.driver.find_element(By.NAME, "nick")
+            pw   = self.driver.find_element(By.NAME, "pass")
+
+            nick.send_keys(Config.LOGIN_EMAIL)
+            pw.send_keys(Config.LOGIN_PASS)
+            pw.submit()
+
+            time.sleep(4)
+            if "login" not in self.driver.current_url.lower():
+                with open(Config.COOKIE_FILE, "wb") as f:
+                    pickle.dump(self.driver.get_cookies(), f)
+                logger.success("Login successful")
+                return True
+        except Exception as e:
+            logger.error(f"Login failed: {e}")
+
+        return False
+
     def close(self):
         if self.driver:
             self.driver.quit()
-            self.logger.info("Browser closed")
 
 # ============================================================================
-# Baqi classes same hain (SheetsManager, MessageRecorder, ProfileScraper etc)
-# Sirf BrowserManager mein changes kiye hain
+# SHEETS
 # ============================================================================
 
-# Agar baqi parts bhi chahiye to bata dena, warna yeh file ab login ke liye bohot strong hai
+class SheetsManager:
+    def __init__(self):
+        self.client = None
+
+    def connect(self):
+        scope = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_file(
+            Config.CREDENTIALS_FILE, scopes=scope
+        )
+        self.client = gspread.authorize(creds)
+        logger.success("Google Sheets connected")
+
+    def get_sheet(self, name: str):
+        wb = self.client.open_by_key(Config.SHEET_ID)
+        try:
+            return wb.worksheet(name)
+        except:
+            ws = wb.add_worksheet(title=name, rows=500, cols=10)
+            ws.append_row([
+                "TYPE","TITLE","CONTENT","IMAGE","TAGS",
+                "STATUS","POST_URL","TIMESTAMP","NOTES"
+            ])
+            return ws
+
+# ============================================================================
+# POST BOT (TEST)
+# ============================================================================
+
+class PostBot:
+    def __init__(self, driver, sheet):
+        self.driver = driver
+        self.sheet = sheet
+
+    def run(self):
+        rows = self.sheet.get_all_values()[1:]
+        logger.info(f"Post queue: {len(rows)}")
+
+        for idx, row in enumerate(rows, start=2):
+            status = row[5].strip().lower()
+            if status == "done":
+                continue
+
+            title = row[1]
+            content = row[2]
+
+            try:
+                self.create_post(title, content)
+                self.sheet.update_cell(idx, 6, "DONE")
+                self.sheet.update_cell(
+                    idx, 8,
+                    datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                )
+                logger.success(f"Post done: {title}")
+            except Exception as e:
+                self.sheet.update_cell(idx, 6, "ERROR")
+                self.sheet.update_cell(idx, 9, str(e))
+                logger.error(str(e))
+
+    def create_post(self, title, content):
+        self.driver.get(f"{BASE_URL}/post/new/")
+        WebDriverWait(self.driver, 10).until(
+            EC.presence_of_element_located((By.NAME, "title"))
+        )
+
+        self.driver.find_element(By.NAME, "title").send_keys(title)
+        self.driver.find_element(By.NAME, "content").send_keys(content)
+        self.driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
+
+        time.sleep(4)
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", required=True, choices=["post"])
+    args = parser.parse_args()
+
+    if not Config.LOGIN_EMAIL or not Config.LOGIN_PASS:
+        logger.error("Secrets missing")
+        sys.exit(1)
+
+    browser = BrowserManager()
+    driver = browser.setup()
+
+    if not browser.login():
+        logger.error("Login failed")
+        sys.exit(1)
+
+    sheets = SheetsManager()
+    sheets.connect()
+
+    if args.mode == "post":
+        sheet = sheets.get_sheet("PostQueue")
+        PostBot(driver, sheet).run()
+
+    browser.close()
+
+if __name__ == "__main__":
+    main()
