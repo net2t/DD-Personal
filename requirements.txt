@@ -1,1 +1,5 @@
-pip install selenium gspread google-auth webdriver-manager python-dotenv rich
+selenium
+gspread
+google-auth
+rich
+webdriver-manager
