@@ -1,1 +1,21 @@
+# Sensitive files
+.env
 credentials.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+logs/
+*.log
+
+# OS files
+.DS_Store
+
+# IDE/project files
+.vscode/
+.idea/
+
+# Others
+*.bak
