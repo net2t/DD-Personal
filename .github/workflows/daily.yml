@@ -1,0 +1,31 @@
+name: DamaDam Daily 🗽
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 1 * * *"   # 01:00 GMT
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240   # // max 4 hours (01–05 GMT)
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Bot
+        env:
+          DD_LOGIN_EMAIL: ${{ secrets.DD_LOGIN_EMAIL }}
+          DD_LOGIN_PASS:  ${{ secrets.DD_LOGIN_PASS }}
+          DD_SHEET_ID:    ${{ secrets.DD_SHEET_ID }}
+        run: |
+          python src/main.py --mode msg
