@@ -12,15 +12,8 @@ Clean, modular, multi-mode automation bot for DamaDam.pk with three complete mod
 
 ```
 damadam-bot/
-├── bot_main.py           # Main entry point
-├── bot_config.py         # Configuration
-├── bot_logger.py         # Logging system
-├── bot_browser.py        # Browser management
-├── bot_sheets.py         # Google Sheets manager
-├── bot_scraper.py        # Profile scraper
-├── bot_messenger.py      # Message sender & recorder
-├── bot_poster.py         # Post creator
-├── bot_inbox.py          # Inbox monitor
+├── main.py               # Main entry point
+├── DamaDam_Bot.py        # Single-file implementation (all logic)
 ├── requirements.txt      # Python dependencies
 ├── .env                  # Environment variables (create this)
 ├── credentials.json      # Google service account (create this)
@@ -138,13 +131,13 @@ Records all sent messages by nickname for tracking.
 
 ```bash
 # Send messages to all pending targets
-python bot_main.py --mode msg
+python main.py --mode msg
 
 # Limit to 10 targets
-python bot_main.py --mode msg --max-profiles 10
+python main.py --mode msg --max-profiles 10
 
 # Debug mode
-DD_DEBUG=1 python bot_main.py --mode msg --max-profiles 1
+DD_DEBUG=1 python main.py --mode msg --max-profiles 1
 ```
 
 **How it works:**
@@ -160,10 +153,10 @@ DD_DEBUG=1 python bot_main.py --mode msg --max-profiles 1
 
 ```bash
 # Create all pending posts
-python bot_main.py --mode post
+python main.py --mode post
 
 # Limit to 5 posts
-python bot_main.py --mode post --max-profiles 5
+python main.py --mode post --max-profiles 5
 ```
 
 **How it works:**
@@ -176,7 +169,7 @@ python bot_main.py --mode post --max-profiles 5
 
 ```bash
 # Check inbox and send replies
-python bot_main.py --mode inbox
+python main.py --mode inbox
 ```
 
 **How it works:**
@@ -248,7 +241,7 @@ Best regards!
 ```bash
 # Delete old cookies and try again
 rm damadam_cookies.pkl
-python bot_main.py --mode msg --max-profiles 1
+python main.py --mode msg --max-profiles 1
 ```
 
 ### No Open Posts Found
@@ -281,7 +274,7 @@ STATUS: pending
 
 2. Run bot:
 ```bash
-python bot_main.py --mode msg --max-profiles 20
+python main.py --mode msg --max-profiles 20
 ```
 
 3. Check results in `MsgList` (STATUS, NOTES, RESULT URL)
@@ -300,7 +293,7 @@ STATUS: pending
 
 2. Run bot:
 ```bash
-python bot_main.py --mode post
+python main.py --mode post
 ```
 
 3. Post URLs saved in `PostQueue`
@@ -309,7 +302,7 @@ python bot_main.py --mode post
 
 1. Run to fetch new messages:
 ```bash
-python bot_main.py --mode inbox
+python main.py --mode inbox
 ```
 
 2. New conversations appear in `InboxQueue`
@@ -318,7 +311,7 @@ python bot_main.py --mode inbox
 
 4. Run again to send:
 ```bash
-python bot_main.py --mode inbox
+python main.py --mode inbox
 ```
 
 5. Full conversation saved in CONVERSATION_LOG
