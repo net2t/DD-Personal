@@ -1,22 +1,21 @@
-# Sensitive files
+# Credentials
 .env
 credentials.json
-
-# Python
-__pycache__/
-*.pyc
+*.pkl
 
 # Logs
 logs/
 *.log
 
-# OS files
-.DS_Store
+# Python
+__pycache__/
+*.pyc
+*.pyo
 
-# IDE/project files
+# IDE
 .vscode/
 .idea/
 
-# Others
-*.bak
-.env
+# OS
+.DS_Store
+Thumbs.db
