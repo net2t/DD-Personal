@@ -7,6 +7,9 @@ credentials.json
 logs/
 *.log
 
+# Local reference repos
+Reference_GithubRepos/
+
 # Python
 __pycache__/
 *.pyc

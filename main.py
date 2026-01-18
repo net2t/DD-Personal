@@ -22,8 +22,10 @@ import argparse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
+from urllib.parse import quote
 
 import gspread
+from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import WorksheetNotFound
 from gspread.utils import rowcol_to_a1
@@ -37,6 +39,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 from rich.console import Console
+
+load_dotenv()
 
 console = Console()
 VERSION = "2.0.0"
@@ -439,7 +443,8 @@ class ProfileScraper:
 
     def scrape_profile(self, nickname: str) -> Optional[Dict]:
         """Scrape user profile data"""
-        url = f"{Config.BASE_URL}/users/{nickname}/"
+        safe_nick = quote(str(nickname).strip(), safe="+")
+        url = f"{Config.BASE_URL}/users/{safe_nick}/"
 
         try:
             self.logger.debug(f"Scraping: {nickname}")
@@ -543,18 +548,35 @@ class ProfileScraper:
         Returns:
             Post URL or None
         """
-        url = f"{Config.BASE_URL}/profile/public/{nickname}/"
+        safe_nick = quote(str(nickname).strip(), safe="+")
+        url = f"{Config.BASE_URL}/profile/public/{safe_nick}/"
 
         try:
             self.logger.debug(f"Finding open post for: {nickname}")
 
-            for page_num in range(1, Config.MAX_POST_PAGES + 1):
+            max_pages = Config.MAX_POST_PAGES if Config.MAX_POST_PAGES > 0 else 4
+
+            for page_num in range(1, max_pages + 1):
                 self.driver.get(url)
                 time.sleep(3)
 
+                # Scroll to load dynamic content
+                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(1)
+
                 # Find all posts on page
-                posts = self.driver.find_elements(By.CSS_SELECTOR, "article.mbl, article")
+                posts = self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "article.mbl, article, div[class*='post'], div[class*='content']"
+                )
                 self.logger.debug(f"Page {page_num}: Found {len(posts)} posts")
+
+                next_href = ""
+                try:
+                    next_link = self.driver.find_element(By.CSS_SELECTOR, "a[rel='next']")
+                    next_href = next_link.get_attribute("href") or ""
+                except Exception:
+                    next_href = ""
 
                 for idx, post in enumerate(posts, 1):
                     try:
@@ -599,15 +621,104 @@ class ProfileScraper:
                         self.logger.debug(f"Post #{idx} check failed: {e}")
                         continue
 
-                # Try next page
+                # Fallback: search for comment/content links globally
+                fallback_selectors = []
+                if post_type in ["text", "any"]:
+                    fallback_selectors.append("a[href*='/comments/text/']")
+                if post_type in ["image", "any"]:
+                    fallback_selectors.append("a[href*='/comments/image/']")
+                fallback_selectors.append("a[href*='/content/']")
+
+                for sel in fallback_selectors:
+                    try:
+                        links = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                        for link in links:
+                            href = link.get_attribute("href") or ""
+                            if href:
+                                clean_href = self.clean_url(href)
+                                self.logger.debug(f"Fallback found post: {clean_href}")
+                                return clean_href
+                    except Exception:
+                        continue
+
+                # JS fallback to collect all matching hrefs
                 try:
-                    next_link = self.driver.find_element(By.CSS_SELECTOR, "a[rel='next']")
-                    next_href = next_link.get_attribute("href") or ""
-                    if not next_href:
-                        break
-                    url = next_href
+                    hrefs = self.driver.execute_script(
+                        "return Array.from(document.querySelectorAll(\"a[href*='/comments/'], a[href*='/content/']\"))"
+                        ".map(a => a.href).filter(Boolean);"
+                    )
+                    for href in hrefs:
+                        clean_href = self.clean_url(href)
+                        if clean_href:
+                            self.logger.debug(f"JS fallback found post: {clean_href}")
+                            return clean_href
                 except Exception:
+                    pass
+
+                # ID fallback: some profiles don't expose /comments/ links on profile page
+                candidate_ids: List[str] = []
+                try:
+                    for post in posts[:30]:
+                        outer = self.driver.execute_script("return arguments[0].outerHTML", post)
+                        nums = re.findall(r"\b\d{7,10}\b", outer)
+                        for n in nums:
+                            try:
+                                iv = int(n)
+                            except Exception:
+                                continue
+                            if iv >= 1_000_000_000:
+                                continue
+                            if iv < 1_000_000:
+                                continue
+
+                            # Heuristic: prefer likely post IDs (usually 8-9 digits) over user IDs (often 7 digits)
+                            if len(n) < 8:
+                                continue
+                            if n not in candidate_ids:
+                                candidate_ids.append(n)
+                except Exception:
+                    candidate_ids = []
+
+                if candidate_ids:
+                    kinds: List[str]
+                    if post_type == "text":
+                        kinds = ["text"]
+                    elif post_type == "image":
+                        kinds = ["image"]
+                    else:
+                        kinds = ["text", "image"]
+
+                    for pid in candidate_ids[:20]:
+                        for kind in kinds:
+                            try:
+                                cand_url = f"{Config.BASE_URL}/comments/{kind}/{pid}"
+                                self.driver.get(cand_url)
+                                time.sleep(2)
+                                src = self.driver.page_source.lower()
+                                if "404" in src or "page not found" in src:
+                                    continue
+
+                                forms = self.driver.find_elements(
+                                    By.CSS_SELECTOR,
+                                    "form[action*='direct-response/send']"
+                                )
+                                if forms:
+                                    # Don't rely on is_displayed() in headless; just validate the textarea exists.
+                                    for f in forms:
+                                        try:
+                                            f.find_element(By.CSS_SELECTOR, "textarea[name='direct_response']")
+                                            self.logger.debug(f"ID fallback found {kind} post: {cand_url}")
+                                            return self.clean_url(self.driver.current_url)
+                                        except Exception:
+                                            continue
+
+                            except Exception:
+                                continue
+
+                # Try next page
+                if not next_href:
                     break
+                url = next_href
 
             self.logger.warning(f"No open posts found for {nickname}")
             return None
@@ -843,15 +954,15 @@ class PostCreator:
                 # Find form elements
                 title_input = self.driver.find_element(
                     By.CSS_SELECTOR,
-                    "input[name='title'], #id_title"
+                    "input[name='title'], #id_title, input[name='heading']"
                 )
                 content_area = self.driver.find_element(
                     By.CSS_SELECTOR,
-                    "textarea[name='text'], #id_text"
+                    "textarea[name='text'], #id_text, textarea[name='content'], #id_content"
                 )
                 submit_btn = self.driver.find_element(
                     By.CSS_SELECTOR,
-                    "button[type='submit']"
+                    "button[type='submit'], input[type='submit'], button.btn-primary"
                 )
 
                 # Fill form
@@ -919,7 +1030,7 @@ class PostCreator:
                 # Find file input
                 file_input = self.driver.find_element(
                     By.CSS_SELECTOR,
-                    "input[type='file']"
+                    "input[type='file'], input[name='file'], input[name='image']"
                 )
 
                 # Upload file
@@ -957,7 +1068,7 @@ class PostCreator:
                 # Submit
                 submit_btn = self.driver.find_element(
                     By.CSS_SELECTOR,
-                    "button[type='submit'], input[type='submit']"
+                    "button[type='submit'], input[type='submit'], button.btn-primary"
                 )
                 self.logger.info("Submitting image post...")
                 submit_btn.click()
@@ -1208,8 +1319,9 @@ def run_message_mode(args):
                 followers = row[5].strip() if len(row) > 5 else ""
                 message = row[6].strip()
                 status = row[7].strip().lower()
+                notes = row[8].strip() if len(row) > 8 else ""
 
-                if nick_or_url and message and status == "pending":
+                if nick_or_url and message and status.startswith("pending"):
                     pending.append({
                         "row": i,
                         "mode": mode,
@@ -1218,7 +1330,8 @@ def run_message_mode(args):
                         "city": city,
                         "posts": posts,
                         "followers": followers,
-                        "message": message
+                        "message": message,
+                        "notes": notes
                     })
 
         if not pending:
@@ -1311,8 +1424,16 @@ def run_message_mode(args):
                     post_url = scraper.find_open_post(nick_or_url, post_type="any")
                     if not post_url:
                         logger.error("❌ No open posts found")
+
+                        max_pages = Config.MAX_POST_PAGES if Config.MAX_POST_PAGES > 0 else 4
                         sheets_mgr.update_cell(msglist, row_num, 8, "Failed")
-                        sheets_mgr.update_cell(msglist, row_num, 9, "No open posts")
+                        sheets_mgr.update_cell(
+                            msglist,
+                            row_num,
+                            9,
+                            f"No open posts found (scanned up to {max_pages} pages)"
+                        )
+
                         failed_count += 1
                         continue
 
@@ -1419,7 +1540,7 @@ def run_post_mode(args):
                 tags = row[4].strip()
                 status = row[5].strip().lower()
 
-                if status == "pending":
+                if status.startswith("pending"):
                     pending.append({
                         "row": i,
                         "type": post_type,
@@ -1551,7 +1672,7 @@ def run_inbox_mode(args):
 
         pending_replies = []
         for i, row in enumerate(all_rows[1:], start=2):
-            if len(row) >= 5 and row[3].strip() and row[4].strip().lower() == "pending":
+            if len(row) >= 5 and row[3].strip() and row[4].strip().lower().startswith("pending"):
                 pending_replies.append({
                     "row": i,
                     "nick": row[0].strip(),
