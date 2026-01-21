@@ -3,6 +3,10 @@
 credentials.json
 *.pkl
 
+# Local binaries
+chromedriver.exe
+chromedriver*.exe
+
 # Logs
 logs/
 *.log

@@ -16,8 +16,14 @@ damadam-bot/
 ├── requirements.txt      # Python dependencies
 ├── .env                  # Environment variables (create this)
 ├── credentials.json      # Google service account (create this)
+├── chromedriver.exe      # ChromeDriver binary (place in repo root)
 └── logs/                 # Auto-created log directory
 ```
+
+Notes:
+
+- **Security**: `.env` and `credentials.json` are intentionally ignored by Git.
+- **Local binary**: `chromedriver.exe` is intentionally ignored by Git.
 
 ## Installation
 
@@ -30,7 +36,6 @@ pip install -r requirements.txt
 **requirements.txt:**
 
 ```text
-
 gspread>=5.8.0
 google-auth>=2.20.0
 google-auth-oauthlib>=1.0.0
@@ -114,6 +119,12 @@ image | Photo |  | C:\images\pic.jpg | nature,photography | pending |  |  |
 - **POST_URL**: Created post URL
 - **TIMESTAMP**: Creation time
 - **NOTES**: Status/errors
+
+Image posts:
+
+- **Caption**: Uses `CONTENT` (caption textarea on DamaDam).
+- **Expiry**: Defaults to `Never expire post`.
+- **Turn Off Replies**: Defaults to `Yes`.
 
 ### Sheet 3: InboxQueue (Inbox Replies)
 

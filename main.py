@@ -943,6 +943,123 @@ class PostCreator:
         self.driver = driver
         self.logger = logger
 
+    def _find_share_form(self, require_file: bool) -> Optional[object]:
+        forms = self.driver.find_elements(By.CSS_SELECTOR, "form")
+        for f in forms:
+            try:
+                has_submit = bool(
+                    f.find_elements(By.CSS_SELECTOR, "button[type='submit'], input[type='submit']")
+                )
+                if not has_submit:
+                    continue
+
+                has_file = bool(f.find_elements(By.CSS_SELECTOR, "input[type='file']"))
+                if require_file and not has_file:
+                    continue
+
+                has_textarea = bool(f.find_elements(By.CSS_SELECTOR, "textarea"))
+                if not has_textarea and not has_file:
+                    continue
+
+                return f
+            except Exception:
+                continue
+        return None
+
+    def _extract_post_url(self) -> str:
+        try:
+            current = self.driver.current_url
+            if "/comments/" in current or "/content/" in current:
+                return current
+
+            try:
+                canonical = self.driver.find_elements(By.CSS_SELECTOR, "link[rel='canonical']")
+                if canonical:
+                    href = (canonical[0].get_attribute("href") or "").strip()
+                    if href and ("/comments/" in href or "/content/" in href):
+                        return href
+            except Exception:
+                pass
+
+            try:
+                og = self.driver.find_elements(By.CSS_SELECTOR, "meta[property='og:url']")
+                if og:
+                    href = (og[0].get_attribute("content") or "").strip()
+                    if href and ("/comments/" in href or "/content/" in href):
+                        return href
+            except Exception:
+                pass
+
+            links = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "a[href*='/comments/text/'], a[href*='/comments/image/'], a[href*='/content/']"
+            )
+            for a in links:
+                try:
+                    href = (a.get_attribute("href") or "").strip()
+                    if href and "damadam.pk" in href:
+                        return href
+                except Exception:
+                    continue
+
+            try:
+                html = self.driver.page_source
+                m = re.search(r"https?://[^\s\"']*(/comments/(?:text|image)/\d+|/content/\d+)", html)
+                if m:
+                    return m.group(0)
+
+                m2 = re.search(r"(/comments/(?:text|image)/\d+|/content/\d+)", html)
+                if m2:
+                    return f"{Config.BASE_URL}{m2.group(1)}"
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return self.driver.current_url
+
+    def _select_radio_option(
+        self,
+        form,
+        name: str,
+        value: str,
+        label_text: str,
+        timeout_seconds: int = 5
+    ) -> bool:
+        try:
+            target = None
+            radios = form.find_elements(
+                By.CSS_SELECTOR,
+                f"input[type='radio'][name='{name}'][value='{value}']"
+            )
+            if radios:
+                target = radios[0]
+            else:
+                try:
+                    label = form.find_element(By.XPATH, f".//label[normalize-space()='{label_text}']")
+                    for_attr = (label.get_attribute("for") or "").strip()
+                    if for_attr:
+                        target = form.find_element(By.ID, for_attr)
+                    else:
+                        target = label
+                except Exception:
+                    return False
+
+            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target)
+            self.driver.execute_script("arguments[0].click();", target)
+
+            WebDriverWait(self.driver, timeout_seconds).until(
+                lambda d: any(
+                    r.is_selected()
+                    for r in form.find_elements(
+                        By.CSS_SELECTOR,
+                        f"input[type='radio'][name='{name}'][value='{value}']"
+                    )
+                )
+            )
+            return True
+        except Exception:
+            return False
+
     def create_text_post(self, title: str, content: str, tags: str = "") -> Dict:
         """Create a text post"""
         try:
@@ -951,25 +1068,36 @@ class PostCreator:
             time.sleep(3)
 
             try:
-                # Find form elements
-                title_input = self.driver.find_element(
+                form = self._find_share_form(require_file=False)
+                if not form:
+                    self.logger.error("Text post form not found")
+                    return {"status": "Form Error", "url": ""}
+
+                title_input = None
+                try:
+                    title_input = form.find_element(
+                        By.CSS_SELECTOR,
+                        "input[name='title'], #id_title, input[name='heading'], input[name='subject']"
+                    )
+                except Exception:
+                    title_input = None
+
+                content_area = form.find_element(
                     By.CSS_SELECTOR,
-                    "input[name='title'], #id_title, input[name='heading']"
+                    "textarea[name='text'], #id_text, textarea[name='content'], #id_content, textarea"
                 )
-                content_area = self.driver.find_element(
+
+                submit_btn = form.find_element(
                     By.CSS_SELECTOR,
-                    "textarea[name='text'], #id_text, textarea[name='content'], #id_content"
-                )
-                submit_btn = self.driver.find_element(
-                    By.CSS_SELECTOR,
-                    "button[type='submit'], input[type='submit'], button.btn-primary"
+                    "button[type='submit'], input[type='submit'], button.btn-primary, button.btn"
                 )
 
                 # Fill form
                 self.logger.debug(f"Title: {title[:50]}...")
-                title_input.clear()
-                title_input.send_keys(title)
-                time.sleep(0.5)
+                if title_input and title:
+                    title_input.clear()
+                    title_input.send_keys(title)
+                    time.sleep(0.5)
 
                 self.logger.debug(f"Content: {len(content)} chars")
                 content_area.clear()
@@ -979,7 +1107,7 @@ class PostCreator:
                 # Tags if available
                 if tags:
                     try:
-                        tags_input = self.driver.find_element(
+                        tags_input = form.find_element(
                             By.CSS_SELECTOR,
                             "input[name='tags'], #id_tags"
                         )
@@ -991,17 +1119,21 @@ class PostCreator:
 
                 # Submit
                 self.logger.info("Submitting text post...")
-                submit_btn.click()
-                time.sleep(4)
+                self.driver.execute_script("arguments[0].click();", submit_btn)
+                try:
+                    WebDriverWait(self.driver, 10).until(lambda d: d.current_url != f"{Config.BASE_URL}/share/text/")
+                except TimeoutException:
+                    pass
+                time.sleep(2)
 
                 # Get result URL
-                post_url = self.driver.current_url
+                post_url = self._extract_post_url()
 
                 if "damadam.pk" in post_url and "/comments/text/" in post_url:
                     self.logger.success(f"Text post created: {post_url}")
                     return {"status": "Posted", "url": post_url}
                 else:
-                    self.logger.warning("Post submitted but URL unclear")
+                    self.logger.warning(f"Post submitted but URL unclear (url={post_url})")
                     return {"status": "Pending Verification", "url": post_url}
 
             except NoSuchElementException as e:
@@ -1012,7 +1144,7 @@ class PostCreator:
             self.logger.error(f"Text post error: {e}")
             return {"status": f"Error: {str(e)[:50]}", "url": ""}
 
-    def create_image_post(self, image_path: str, title: str = "", tags: str = "") -> Dict:
+    def create_image_post(self, image_path: str, title: str = "", content: str = "", tags: str = "") -> Dict:
         """Create an image post from local file"""
         try:
             self.logger.info("Creating image post...")
@@ -1027,8 +1159,13 @@ class PostCreator:
             time.sleep(3)
 
             try:
+                form = self._find_share_form(require_file=True)
+                if not form:
+                    self.logger.error("Image upload form not found")
+                    return {"status": "Form Error", "url": ""}
+
                 # Find file input
-                file_input = self.driver.find_element(
+                file_input = form.find_element(
                     By.CSS_SELECTOR,
                     "input[type='file'], input[name='file'], input[name='image']"
                 )
@@ -1039,10 +1176,32 @@ class PostCreator:
                 self.logger.debug("Image uploaded")
                 time.sleep(2)
 
+                caption = content or title
+                if caption:
+                    try:
+                        caption_area = form.find_element(By.CSS_SELECTOR, "textarea")
+                        caption_area.clear()
+                        caption_area.send_keys(caption)
+                    except Exception:
+                        pass
+
+                self._select_radio_option(
+                    form=form,
+                    name="exp",
+                    value="i",
+                    label_text="Never expire post"
+                )
+                self._select_radio_option(
+                    form=form,
+                    name="com",
+                    value="0",
+                    label_text="Yes"
+                )
+
                 # Title if available
                 if title:
                     try:
-                        title_input = self.driver.find_element(
+                        title_input = form.find_element(
                             By.CSS_SELECTOR,
                             "input[name='title'], #id_title"
                         )
@@ -1055,7 +1214,7 @@ class PostCreator:
                 # Tags if available
                 if tags:
                     try:
-                        tags_input = self.driver.find_element(
+                        tags_input = form.find_element(
                             By.CSS_SELECTOR,
                             "input[name='tags'], #id_tags"
                         )
@@ -1066,22 +1225,28 @@ class PostCreator:
                         self.logger.debug("Tags field not found")
 
                 # Submit
-                submit_btn = self.driver.find_element(
+                submit_btn = form.find_element(
                     By.CSS_SELECTOR,
                     "button[type='submit'], input[type='submit'], button.btn-primary"
                 )
                 self.logger.info("Submitting image post...")
-                submit_btn.click()
-                time.sleep(5)  # Images take longer to process
+                self.driver.execute_script("arguments[0].click();", submit_btn)
+                try:
+                    WebDriverWait(self.driver, 15).until(
+                        lambda d: d.current_url != f"{Config.BASE_URL}/share/photo/upload/"
+                    )
+                except TimeoutException:
+                    pass
+                time.sleep(2)
 
                 # Get result URL
-                post_url = self.driver.current_url
+                post_url = self._extract_post_url()
 
                 if "damadam.pk" in post_url and ("/comments/image/" in post_url or "/content/" in post_url):
                     self.logger.success(f"Image post created: {post_url}")
                     return {"status": "Posted", "url": post_url}
                 else:
-                    self.logger.warning("Post submitted but URL unclear")
+                    self.logger.warning(f"Post submitted but URL unclear (url={post_url})")
                     return {"status": "Pending Verification", "url": post_url}
 
             except NoSuchElementException as e:
@@ -1579,6 +1744,7 @@ def run_post_mode(args):
                     result = creator.create_image_post(
                         image_path=post["image_path"],
                         title=post["title"],
+                        content=post["content"],
                         tags=post["tags"]
                     )
                 else:
@@ -1592,6 +1758,13 @@ def run_post_mode(args):
                 if result and "Posted" in result["status"]:
                     sheets_mgr.update_cell(post_queue, post["row"], 6, "Done")
                     sheets_mgr.update_cell(post_queue, post["row"], 7, result["url"])
+                    sheets_mgr.update_cell(post_queue, post["row"], 8, timestamp)
+                    sheets_mgr.update_cell(post_queue, post["row"], 9, result["status"])
+                    success += 1
+                elif result and "Verification" in result.get("status", ""):
+                    sheets_mgr.update_cell(post_queue, post["row"], 6, "Done")
+                    if result.get("url"):
+                        sheets_mgr.update_cell(post_queue, post["row"], 7, result["url"])
                     sheets_mgr.update_cell(post_queue, post["row"], 8, timestamp)
                     sheets_mgr.update_cell(post_queue, post["row"], 9, result["status"])
                     success += 1
