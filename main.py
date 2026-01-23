@@ -413,7 +413,7 @@ class SheetsManager:
         # Define headers for each sheet type
         headers_map = {
             "MsgList": [
-                "MODE", "NAME", "NICK/URL", "CITY", "POSTS", "FOLLOWERS",
+                "MODE", "NAME", "NICK/URL", "CITY", "POSTS", "FOLLOWERS", "Gender",
                 "MESSAGE", "STATUS", "NOTES", "RESULT URL"
             ],
             "PostQueue": [
@@ -922,6 +922,15 @@ class MessageSender:
         self.scraper = scraper
         self.recorder = recorder
 
+    @staticmethod
+    def _strip_non_bmp(text: str) -> str:
+        if not text:
+            return ""
+        try:
+            return "".join(ch for ch in text if ord(ch) <= 0xFFFF)
+        except Exception:
+            return text
+
     def send_message(self, post_url: str, message: str, nick: str = "") -> Dict:
         """Send message to a post and verify"""
         try:
@@ -969,6 +978,11 @@ class MessageSender:
                 By.CSS_SELECTOR,
                 "button[type='submit']"
             )
+
+            safe_message = self._strip_non_bmp(message)
+            if safe_message != message:
+                self.logger.debug("Message contained non-BMP characters; stripping for ChromeDriver compatibility")
+            message = safe_message
 
             # Limit message to 350 chars
             if len(message) > 350:
@@ -1036,17 +1050,25 @@ class MessageSender:
         message = template
 
         replacements = {
-            "{{name}}": profile.get("NAME", "Unknown"),
-            "{{nick}}": profile.get("NICK", "Unknown"),
-            "{{city}}": profile.get("CITY", "Unknown"),
-            "{{posts}}": str(profile.get("POSTS", "0")),
-            "{{followers}}": str(profile.get("FOLLOWERS", "0")),
+            "{{name}}": (profile.get("NAME") or ""),
+            "{{nick}}": (profile.get("NICK") or ""),
+            "{{city}}": (profile.get("CITY") or ""),
+            "{{posts}}": str(profile.get("POSTS") or ""),
+            "{{followers}}": str(profile.get("FOLLOWERS") or ""),
+            "{{gender}}": (profile.get("GENDER") or profile.get("Gender") or ""),
         }
 
         for placeholder, value in replacements.items():
             message = message.replace(placeholder, value)
 
-        return message
+        if not replacements.get("{{city}}", "").strip():
+            message = re.sub(r"(?i)(?:,\s*)?no\s*city\b", "", message)
+
+        message = re.sub(r"\{\{[^}]+\}\}", "", message)
+        message = re.sub(r"\s+", " ", message).strip()
+        message = re.sub(r"\s+([,?.!])", r"\1", message)
+        message = re.sub(r",\s*,", ",", message)
+        return message.strip()
 
 # ============================================================================
 # POST CREATOR
@@ -1847,21 +1869,55 @@ def run_message_mode(args):
         sheets_mgr.api_calls += 1
         all_rows = msglist.get_all_values()
 
+        headers = all_rows[0] if all_rows else []
+        header_map: Dict[str, int] = {}
+        for idx, h in enumerate(headers, start=1):
+            key = (h or "").strip().lower()
+            if key:
+                header_map[key] = idx
+
+        def _col(*names: str, default: Optional[int] = None) -> Optional[int]:
+            for n in names:
+                k = (n or "").strip().lower()
+                if k in header_map:
+                    return header_map[k]
+            return default
+
+        gender_col = _col("gender", "Gender")
+        mode_col = _col("mode", default=1)
+        name_col = _col("name", default=2)
+        nick_col = _col("nick/url", "nick", "nick/url ", "nick/url", default=3)
+        city_col = _col("city", default=4)
+        posts_col = _col("posts", default=5)
+        followers_col = _col("followers", default=6)
+        message_col = _col("message", default=8 if gender_col else 7)
+        status_col = _col("status", default=9 if gender_col else 8)
+        notes_col = _col("notes", default=10 if gender_col else 9)
+        result_url_col = _col("result url", "result_url", "resulturl", default=11 if gender_col else 10)
+
         pending = []
         pending_status_rows = 0
         pending_missing_message = 0
         pending_missing_nick = 0
         for i, row in enumerate(all_rows[1:], start=2):
-            cols = list(row) + [""] * (10 - len(row))
-            mode = (cols[0] or "").strip().lower()
-            name = (cols[1] or "").strip()
-            nick_or_url = (cols[2] or "").strip()
-            city = (cols[3] or "").strip()
-            posts = (cols[4] or "").strip()
-            followers = (cols[5] or "").strip()
-            message = (cols[6] or "").strip()
-            status = (cols[7] or "").strip().lower()
-            notes = (cols[8] or "").strip()
+            def _cell(col_idx: Optional[int]) -> str:
+                if not col_idx:
+                    return ""
+                j = col_idx - 1
+                if j < 0 or j >= len(row):
+                    return ""
+                return (row[j] or "").strip()
+
+            mode = _cell(mode_col).lower()
+            name = _cell(name_col)
+            nick_or_url = _cell(nick_col)
+            city = _cell(city_col)
+            posts = _cell(posts_col)
+            followers = _cell(followers_col)
+            gender = _cell(gender_col)
+            message = _cell(message_col)
+            status = _cell(status_col).lower()
+            notes = _cell(notes_col)
 
             if status.startswith("pending"):
                 pending_status_rows += 1
@@ -1880,6 +1936,7 @@ def run_message_mode(args):
                     "city": city,
                     "posts": posts,
                     "followers": followers,
+                    "gender": gender,
                     "message": message,
                     "notes": notes
                 })
@@ -1925,7 +1982,8 @@ def run_message_mode(args):
                     "NICK": nick_or_url,
                     "CITY": target.get("city", ""),
                     "POSTS": target.get("posts", "0"),
-                    "FOLLOWERS": target.get("followers", "0")
+                    "FOLLOWERS": target.get("followers", "0"),
+                    "GENDER": target.get("gender", "")
                 }
 
                 # Handle MODE
@@ -1945,8 +2003,8 @@ def run_message_mode(args):
                     profile = scraper.scrape_profile(nick_or_url)
                     if not profile:
                         logger.error("❌ Profile scrape failed")
-                        sheets_mgr.update_cell(msglist, row_num, 8, "Failed")
-                        sheets_mgr.update_cell(msglist, row_num, 9, "Profile scrape failed")
+                        sheets_mgr.update_cell(msglist, row_num, status_col or 8, "Failed")
+                        sheets_mgr.update_cell(msglist, row_num, notes_col or 9, "Profile scrape failed")
                         try:
                             activity.log(
                                 mode="msg",
@@ -1964,8 +2022,8 @@ def run_message_mode(args):
                     # Check if suspended
                     if profile.get("STATUS") == "Suspended":
                         logger.warning("⚠️ Account suspended")
-                        sheets_mgr.update_cell(msglist, row_num, 8, "Skipped")
-                        sheets_mgr.update_cell(msglist, row_num, 9, "Account suspended")
+                        sheets_mgr.update_cell(msglist, row_num, status_col or 8, "Skipped")
+                        sheets_mgr.update_cell(msglist, row_num, notes_col or 9, "Account suspended")
                         try:
                             activity.log(
                                 mode="msg",
@@ -1982,18 +2040,20 @@ def run_message_mode(args):
 
                     # Update sheet with profile data
                     if profile.get("CITY"):
-                        sheets_mgr.update_cell(msglist, row_num, 4, profile["CITY"])
+                        sheets_mgr.update_cell(msglist, row_num, city_col or 4, profile["CITY"])
                     if profile.get("POSTS"):
-                        sheets_mgr.update_cell(msglist, row_num, 5, profile["POSTS"])
+                        sheets_mgr.update_cell(msglist, row_num, posts_col or 5, profile["POSTS"])
                     if profile.get("FOLLOWERS"):
-                        sheets_mgr.update_cell(msglist, row_num, 6, profile["FOLLOWERS"])
+                        sheets_mgr.update_cell(msglist, row_num, followers_col or 6, profile["FOLLOWERS"])
+                    if gender_col and profile.get("GENDER"):
+                        sheets_mgr.update_cell(msglist, row_num, gender_col, profile["GENDER"])
 
                     # Check post count
                     post_count = int(profile.get("POSTS", "0"))
                     if post_count == 0:
                         logger.warning("⚠️ No posts available")
-                        sheets_mgr.update_cell(msglist, row_num, 8, "Skipped")
-                        sheets_mgr.update_cell(msglist, row_num, 9, "No posts")
+                        sheets_mgr.update_cell(msglist, row_num, status_col or 8, "Skipped")
+                        sheets_mgr.update_cell(msglist, row_num, notes_col or 9, "No posts")
                         try:
                             activity.log(
                                 mode="msg",
@@ -2015,11 +2075,11 @@ def run_message_mode(args):
                         logger.error("❌ No open posts found")
 
                         max_pages = Config.MAX_POST_PAGES if Config.MAX_POST_PAGES > 0 else 4
-                        sheets_mgr.update_cell(msglist, row_num, 8, "Failed")
+                        sheets_mgr.update_cell(msglist, row_num, status_col or 8, "Failed")
                         sheets_mgr.update_cell(
                             msglist,
                             row_num,
-                            9,
+                            notes_col or 9,
                             f"No open posts found (scanned up to {max_pages} pages)"
                         )
 
@@ -2077,25 +2137,25 @@ def run_message_mode(args):
                 if "Posted" in result["status"]:
                     logger.success("✅ SUCCESS - Message posted!")
                     logger.info(f"🔗 URL: {result['url']}")
-                    sheets_mgr.update_cell(msglist, row_num, 8, "Done")
-                    sheets_mgr.update_cell(msglist, row_num, 9, f"Posted @ {timestamp}")
-                    sheets_mgr.update_cell(msglist, row_num, 10, result["url"])
+                    sheets_mgr.update_cell(msglist, row_num, status_col or 8, "Done")
+                    sheets_mgr.update_cell(msglist, row_num, notes_col or 9, f"Posted @ {timestamp}")
+                    sheets_mgr.update_cell(msglist, row_num, result_url_col or 10, result["url"])
                     success_count += 1
 
                 elif "Verification" in result["status"]:
                     logger.warning("⚠️ Needs manual verification")
                     logger.info(f"🔗 Check: {result['url']}")
-                    sheets_mgr.update_cell(msglist, row_num, 8, "Done")
-                    sheets_mgr.update_cell(msglist, row_num, 9, f"Verify @ {timestamp}")
-                    sheets_mgr.update_cell(msglist, row_num, 10, result["url"])
+                    sheets_mgr.update_cell(msglist, row_num, status_col or 8, "Done")
+                    sheets_mgr.update_cell(msglist, row_num, notes_col or 9, f"Verify @ {timestamp}")
+                    sheets_mgr.update_cell(msglist, row_num, result_url_col or 10, result["url"])
                     success_count += 1
 
                 else:
                     logger.error(f"❌ FAILED - {result['status']}")
-                    sheets_mgr.update_cell(msglist, row_num, 8, "Failed")
-                    sheets_mgr.update_cell(msglist, row_num, 9, result["status"])
+                    sheets_mgr.update_cell(msglist, row_num, status_col or 8, "Failed")
+                    sheets_mgr.update_cell(msglist, row_num, notes_col or 9, result["status"])
                     if result.get("url"):
-                        sheets_mgr.update_cell(msglist, row_num, 10, result["url"])
+                        sheets_mgr.update_cell(msglist, row_num, result_url_col or 10, result["url"])
                     failed_count += 1
 
                 # Rate limiting
@@ -2104,8 +2164,8 @@ def run_message_mode(args):
             except Exception as e:
                 error_msg = str(e)[:60]
                 logger.error(f"❌ Error: {error_msg}")
-                sheets_mgr.update_cell(msglist, target["row"], 8, "Failed")
-                sheets_mgr.update_cell(msglist, target["row"], 9, error_msg)
+                sheets_mgr.update_cell(msglist, target["row"], status_col or 8, "Failed")
+                sheets_mgr.update_cell(msglist, target["row"], notes_col or 9, error_msg)
                 failed_count += 1
 
                 try:
