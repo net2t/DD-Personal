@@ -60,6 +60,10 @@ rich>=13.0.0
 DD_LOGIN_EMAIL=your_username
 DD_LOGIN_PASS=your_password
 
+# Secondary login (optional fallback)
+DD_LOGIN_EMAIL2=backup_username
+DD_LOGIN_PASS2=backup_password
+
 # Google Sheets
 DD_SHEET_ID=your_main_sheet_id
 DD_PROFILES_SHEET_ID=your_profiles_sheet_id
@@ -103,22 +107,24 @@ url  | Sara | https://damadam.pk/comments/text/12345 |  |  |  | Hi there! | pend
 Example rows:
 
 ```text
-TYPE  | TITLE  | CONTENT | IMAGE_PATH       | TAGS              | STATUS  | POST_URL | TIMESTAMP | NOTES
-text  | My Post | This is my content... |  | tech,news | pending |  |  | 
-image | Photo |  | C:\images\pic.jpg | nature,photography | pending |  |  | 
+TYPE  | CONTENT | IMAGE_PATH       | STATUS  | POST_URL | TIMESTAMP | NOTES
+text  | This is my content... |  | pending |  |  | 
+image | My caption | C:\images\pic.jpg | pending |  |  | 
 ```
 
 **Columns:**
 
 - **TYPE**: `text` or `image`
-- **TITLE**: Post title
-- **CONTENT**: Text content (for text posts)
+- **CONTENT**: Text content (for text posts) / caption (for image posts)
 - **IMAGE_PATH**: Full path to image file (for image posts)
-- **TAGS**: Comma-separated tags
 - **STATUS**: `pending` → `Done/Failed`
 - **POST_URL**: Created post URL
 - **TIMESTAMP**: Creation time
 - **NOTES**: Status/errors
+
+Compatibility:
+
+- If your existing sheet still has `TITLE` and `TAGS` columns (older layout), the bot will still work.
 
 Image posts:
 

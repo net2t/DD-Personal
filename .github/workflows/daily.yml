@@ -2,8 +2,6 @@ name: DamaDam Daily 🗽
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 1 * * *"   # 01:00 GMT
 
 jobs:
   run-bot:
@@ -18,14 +16,40 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install Chrome
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
 
-      - name: Run Bot
+      - name: Write Google credentials
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          python - <<'PY'
+          import os
+          data = os.getenv('GOOGLE_CREDENTIALS_JSON', '')
+          if not data:
+              raise SystemExit('Missing secret GOOGLE_CREDENTIALS_JSON')
+          with open('credentials.json', 'w', encoding='utf-8') as f:
+              f.write(data)
+          PY
+
+      - name: Run Bot (Msg + Post)
         env:
           DD_LOGIN_EMAIL: ${{ secrets.DD_LOGIN_EMAIL }}
           DD_LOGIN_PASS:  ${{ secrets.DD_LOGIN_PASS }}
           DD_SHEET_ID:    ${{ secrets.DD_SHEET_ID }}
         run: |
-          python src/main.py --mode msg
+          python main.py --mode msg
+          python main.py --mode post
+
+      - name: Upload Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: damadam-daily-logs-${{ github.run_number }}
+          path: logs/*.log

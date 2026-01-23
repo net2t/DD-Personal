@@ -19,10 +19,16 @@ import sys
 import re
 import pickle
 import argparse
+import tempfile
+import mimetypes
+import urllib.request
+import urllib.error
+import socket
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, parse_qs
 
 import gspread
 from dotenv import load_dotenv
@@ -39,8 +45,16 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 from rich.console import Console
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 
-load_dotenv()
+try:
+    logging.getLogger("dotenv").setLevel(logging.ERROR)
+    logging.getLogger("dotenv.main").setLevel(logging.ERROR)
+except Exception:
+    pass
+
+load_dotenv(override=False)
 
 console = Console()
 VERSION = "2.0.0"
@@ -55,6 +69,8 @@ class Config:
     # Authentication
     LOGIN_EMAIL = os.getenv("DD_LOGIN_EMAIL", "0utLawZ")
     LOGIN_PASS = os.getenv("DD_LOGIN_PASS", "asdasd")
+    LOGIN_EMAIL2 = os.getenv("DD_LOGIN_EMAIL2", "").strip()
+    LOGIN_PASS2 = os.getenv("DD_LOGIN_PASS2", "").strip()
     COOKIE_FILE = os.getenv("COOKIE_FILE", "damadam_cookies.pkl")
 
     # Google Sheets
@@ -68,7 +84,21 @@ class Config:
     # Bot Settings
     DEBUG = os.getenv("DD_DEBUG", "0") == "1"
     MAX_PROFILES = int(os.getenv("DD_MAX_PROFILES", "0"))
-    MAX_POST_PAGES = int(os.getenv("DD_MAX_POST_PAGES", "4"))
+    MAX_POST_PAGES = int(os.getenv("DD_MAX_POST_PAGES", "4") or "4")
+    POST_COOLDOWN_SECONDS = int(os.getenv("DD_POST_COOLDOWN_SECONDS", "120") or "120")
+    POST_RETRY_FAILED = os.getenv("DD_POST_RETRY_FAILED", "1") == "1"
+    POST_MAX_ATTEMPTS = int(os.getenv("DD_POST_MAX_ATTEMPTS", "3") or "3")
+
+    POST_DENIED_RETRIES = int(os.getenv("DD_POST_DENIED_RETRIES", "1") or "1")
+    POST_DENIED_BACKOFF_SECONDS = int(os.getenv("DD_POST_DENIED_BACKOFF_SECONDS", "600") or "600")
+
+    POST_MAX_REPEAT_CHARS = int(os.getenv("DD_POST_MAX_REPEAT_CHARS", "6") or "6")
+    POST_CAPTION_MAX_LEN = int(os.getenv("DD_POST_CAPTION_MAX_LEN", "300") or "300")
+    POST_TAGS_MAX_LEN = int(os.getenv("DD_POST_TAGS_MAX_LEN", "120") or "120")
+
+    IMAGE_DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("DD_IMAGE_DOWNLOAD_TIMEOUT_SECONDS", "90") or "90")
+    IMAGE_DOWNLOAD_RETRIES = int(os.getenv("DD_IMAGE_DOWNLOAD_RETRIES", "3") or "3")
+    IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS = int(os.getenv("DD_IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS", "5") or "5")
 
     # URLs
     BASE_URL = "https://damadam.pk"
@@ -101,7 +131,7 @@ class Logger:
         """Internal log method"""
         pkt_time = self._get_pkt_time()
         timestamp = pkt_time.strftime("%H:%M:%S")
-        safe_message = self._sanitize_message(message)
+        safe_message = message if isinstance(message, str) else str(message)
 
         # Console output with colors
         color_map = {
@@ -113,10 +143,17 @@ class Logger:
         }
         color = color_map.get(level, "white")
 
-        if level == "INFO":
-            console.print(f"[{timestamp}] {safe_message}")
-        else:
-            console.print(f"[{timestamp}] [{level}] {safe_message}", style=color)
+        try:
+            if level == "INFO":
+                console.print(f"[{timestamp}] {safe_message}")
+            else:
+                console.print(f"[{timestamp}] [{level}] {safe_message}", style=color)
+        except UnicodeEncodeError:
+            safe_ascii = self._sanitize_message(safe_message)
+            if level == "INFO":
+                console.print(f"[{timestamp}] {safe_ascii}")
+            else:
+                console.print(f"[{timestamp}] [{level}] {safe_ascii}", style=color)
 
         # File output
         with open(self.log_file, "a", encoding="utf-8") as f:
@@ -168,16 +205,26 @@ class BrowserManager:
             opts.add_argument("--headless=new")
             opts.add_argument("--window-size=1920,1080")
             opts.add_argument("--disable-blink-features=AutomationControlled")
-            opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+            opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
             opts.add_experimental_option("useAutomationExtension", False)
             opts.add_argument("--no-sandbox")
             opts.add_argument("--disable-dev-shm-usage")
             opts.add_argument("--disable-gpu")
+            opts.add_argument("--disable-logging")
+            opts.add_argument("--log-level=3")
             opts.page_load_strategy = "eager"
 
             # Try to use specified chromedriver
-            if Config.CHROMEDRIVER_PATH and os.path.exists(Config.CHROMEDRIVER_PATH):
-                service = Service(Config.CHROMEDRIVER_PATH)
+            driver_path = Config.CHROMEDRIVER_PATH
+            if driver_path and not os.path.isabs(driver_path):
+                driver_path = str(Path(__file__).resolve().parent / driver_path)
+
+            if driver_path and os.path.exists(driver_path):
+                try:
+                    devnull = open(os.devnull, "w")
+                    service = Service(driver_path, service_args=["--log-level=OFF"], log_output=devnull)
+                except Exception:
+                    service = Service(driver_path)
                 self.driver = webdriver.Chrome(service=service, options=opts)
             else:
                 self.driver = webdriver.Chrome(options=opts)
@@ -199,6 +246,37 @@ class BrowserManager:
         if not self.driver:
             return False
 
+        def attempt_login(user: str, pwd: str) -> bool:
+            if not user or not pwd:
+                return False
+            try:
+                self.driver.get(Config.LOGIN_URL)
+                time.sleep(3)
+
+                nick_input = WebDriverWait(self.driver, 8).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "#nick, input[name='nick']"))
+                )
+                pass_input = self.driver.find_element(By.CSS_SELECTOR, "#pass, input[name='pass']")
+                submit_btn = self.driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
+
+                nick_input.clear()
+                nick_input.send_keys(user)
+                time.sleep(0.5)
+
+                pass_input.clear()
+                pass_input.send_keys(pwd)
+                time.sleep(0.5)
+
+                submit_btn.click()
+                time.sleep(4)
+
+                if "login" not in self.driver.current_url.lower():
+                    self._save_cookies()
+                    return True
+                return False
+            except Exception:
+                return False
+
         try:
             # Try loading cookies first
             if self._load_cookies():
@@ -213,34 +291,17 @@ class BrowserManager:
                 else:
                     self.logger.debug("Cookies expired, fresh login needed")
 
-            # Fresh login
+            # Fresh login (primary -> secondary fallback)
             self.logger.debug("Performing fresh login...")
-            self.driver.get(Config.LOGIN_URL)
-            time.sleep(3)
-
-            # Find and fill login form
-            nick_input = WebDriverWait(self.driver, 8).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "#nick, input[name='nick']"))
-            )
-            pass_input = self.driver.find_element(By.CSS_SELECTOR, "#pass, input[name='pass']")
-            submit_btn = self.driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
-
-            nick_input.clear()
-            nick_input.send_keys(Config.LOGIN_EMAIL)
-            time.sleep(0.5)
-
-            pass_input.clear()
-            pass_input.send_keys(Config.LOGIN_PASS)
-            time.sleep(0.5)
-
-            submit_btn.click()
-            time.sleep(4)
-
-            # Verify login
-            if "login" not in self.driver.current_url.lower():
-                self._save_cookies()
+            if attempt_login(Config.LOGIN_EMAIL, Config.LOGIN_PASS):
                 self.logger.debug("Fresh login successful")
                 return True
+
+            if Config.LOGIN_EMAIL2 and Config.LOGIN_PASS2:
+                self.logger.warning("Primary login failed, trying secondary credentials...")
+                if attempt_login(Config.LOGIN_EMAIL2, Config.LOGIN_PASS2):
+                    self.logger.debug("Secondary login successful")
+                    return True
 
             self.logger.error("Login failed - check credentials")
             return False
@@ -326,7 +387,7 @@ class SheetsManager:
             self.logger.error(f"Sheets connection failed: {e}")
             return False
 
-    def get_sheet(self, sheet_id: str, sheet_name: str):
+    def get_sheet(self, sheet_id: str, sheet_name: str, create_if_missing: bool = True):
         """Get or create worksheet"""
         try:
             workbook = self.client.open_by_key(sheet_id)
@@ -337,7 +398,8 @@ class SheetsManager:
                 self.logger.debug(f"Found sheet: {sheet_name}")
                 return sheet
             except WorksheetNotFound:
-                # Create new sheet
+                if not create_if_missing:
+                    return None
                 self.logger.warning(f"Sheet '{sheet_name}' not found, creating...")
                 return self._create_sheet(workbook, sheet_name)
 
@@ -355,16 +417,30 @@ class SheetsManager:
                 "MESSAGE", "STATUS", "NOTES", "RESULT URL"
             ],
             "PostQueue": [
-                "TYPE", "TITLE", "CONTENT", "IMAGE_PATH", "TAGS",
+                "TYPE", "CONTENT", "IMAGE_PATH",
                 "STATUS", "POST_URL", "TIMESTAMP", "NOTES"
             ],
             "InboxQueue": [
                 "NICK", "NAME", "LAST_MSG", "MY_REPLY", "STATUS",
                 "TIMESTAMP", "NOTES", "CONVERSATION_LOG"
             ],
+            "Inbox": [
+                "NICK", "NAME", "LAST_MSG", "MY_REPLY", "STATUS",
+                "TIMESTAMP", "NOTES", "CONVERSATION_LOG"
+            ],
+            "Inbox & Activity": [
+                "NICK", "NAME", "LAST_MSG", "MY_REPLY", "STATUS",
+                "TIMESTAMP", "NOTES", "CONVERSATION_LOG"
+            ],
             "MsgHistory": [
                 "TIMESTAMP", "NICK", "NAME", "MESSAGE", "POST_URL",
                 "STATUS", "RESULT_URL"
+            ],
+            "ActivityLog": [
+                "TIMESTAMP", "MODE", "ACTION", "NICK", "URL", "STATUS", "DETAILS"
+            ],
+            "ConversationLog": [
+                "TIMESTAMP", "NICK", "DIRECTION", "MODE", "MESSAGE", "URL", "STATUS"
             ],
         }
 
@@ -733,6 +809,10 @@ class ProfileScraper:
         if not url:
             return ""
 
+        content_match = re.search(r"/content/(\d+)", url)
+        if content_match:
+            return f"{Config.BASE_URL}/comments/image/{content_match.group(1)}"
+
         url = str(url).strip()
 
         # Extract clean post ID
@@ -792,6 +872,42 @@ class MessageRecorder:
 
         self.sheets.append_row(self.history_sheet, values)
         self.logger.debug(f"Recorded message history for: {nick}")
+
+
+class ActivityLogger:
+    def __init__(self, sheets_manager: SheetsManager, logger: Logger):
+        self.sheets = sheets_manager
+        self.logger = logger
+        self.sheet = None
+
+    def initialize(self) -> bool:
+        self.sheet = self.sheets.get_sheet(Config.SHEET_ID, "ActivityLog")
+        return bool(self.sheet)
+
+    def log(self, mode: str, action: str, nick: str = "", url: str = "", status: str = "", details: str = ""):
+        if not self.sheet:
+            return
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        values = [timestamp, mode, action, nick, url, status, (details or "")[:45000]]
+        self.sheets.append_row(self.sheet, values)
+
+
+class ConversationLogger:
+    def __init__(self, sheets_manager: SheetsManager, logger: Logger):
+        self.sheets = sheets_manager
+        self.logger = logger
+        self.sheet = None
+
+    def initialize(self) -> bool:
+        self.sheet = self.sheets.get_sheet(Config.SHEET_ID, "ConversationLog")
+        return bool(self.sheet)
+
+    def log(self, nick: str, direction: str, mode: str, message: str, url: str = "", status: str = ""):
+        if not self.sheet:
+            return
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        values = [timestamp, nick, direction, mode, (message or "")[:45000], url, status]
+        self.sheets.append_row(self.sheet, values)
 
 # ============================================================================
 # MESSAGE SENDER
@@ -970,14 +1086,14 @@ class PostCreator:
         try:
             current = self.driver.current_url
             if "/comments/" in current or "/content/" in current:
-                return current
+                return ProfileScraper.clean_url(current)
 
             try:
                 canonical = self.driver.find_elements(By.CSS_SELECTOR, "link[rel='canonical']")
                 if canonical:
                     href = (canonical[0].get_attribute("href") or "").strip()
                     if href and ("/comments/" in href or "/content/" in href):
-                        return href
+                        return ProfileScraper.clean_url(href)
             except Exception:
                 pass
 
@@ -986,7 +1102,7 @@ class PostCreator:
                 if og:
                     href = (og[0].get_attribute("content") or "").strip()
                     if href and ("/comments/" in href or "/content/" in href):
-                        return href
+                        return ProfileScraper.clean_url(href)
             except Exception:
                 pass
 
@@ -998,7 +1114,7 @@ class PostCreator:
                 try:
                     href = (a.get_attribute("href") or "").strip()
                     if href and "damadam.pk" in href:
-                        return href
+                        return ProfileScraper.clean_url(href)
                 except Exception:
                     continue
 
@@ -1006,16 +1122,229 @@ class PostCreator:
                 html = self.driver.page_source
                 m = re.search(r"https?://[^\s\"']*(/comments/(?:text|image)/\d+|/content/\d+)", html)
                 if m:
-                    return m.group(0)
+                    return ProfileScraper.clean_url(m.group(0))
 
                 m2 = re.search(r"(/comments/(?:text|image)/\d+|/content/\d+)", html)
                 if m2:
-                    return f"{Config.BASE_URL}{m2.group(1)}"
+                    return ProfileScraper.clean_url(f"{Config.BASE_URL}{m2.group(1)}")
             except Exception:
                 pass
         except Exception:
             pass
-        return self.driver.current_url
+        return ProfileScraper.clean_url(self.driver.current_url)
+
+    @staticmethod
+    def _is_denied_or_share_url(url: str) -> bool:
+        u = (url or "").strip().lower()
+        if not u:
+            return True
+        if "/share/" in u:
+            return True
+        if "upload-denied" in u:
+            return True
+        if "/login" in u or "/signup" in u:
+            return True
+        return False
+
+    @staticmethod
+    def _collapse_repeats(text: str, max_run: int) -> str:
+        if not text:
+            return ""
+        try:
+            n = max(2, int(max_run))
+            return re.sub(r"(.)\\1{" + str(n) + r",}", lambda m: m.group(1) * n, text)
+        except Exception:
+            return text
+
+    @classmethod
+    def _sanitize_caption(cls, caption: str) -> str:
+        c = (caption or "").strip()
+        if not c:
+            return ""
+        c = cls._collapse_repeats(c, Config.POST_MAX_REPEAT_CHARS)
+        max_len = max(1, int(Config.POST_CAPTION_MAX_LEN))
+        if len(c) > max_len:
+            c = c[:max_len]
+        return c
+
+    @classmethod
+    def _sanitize_tags(cls, tags: str) -> str:
+        t = (tags or "").strip()
+        if not t:
+            return ""
+        t = cls._collapse_repeats(t, Config.POST_MAX_REPEAT_CHARS)
+        max_len = max(1, int(Config.POST_TAGS_MAX_LEN))
+        if len(t) > max_len:
+            t = t[:max_len]
+        return t
+
+    @staticmethod
+    def _extract_drive_file_id(value: str) -> str:
+        if not value:
+            return ""
+
+        s = value.strip()
+        m = re.search(r"/file/d/([^/]+)", s)
+        if m:
+            return m.group(1)
+
+        try:
+            parsed = urlparse(s)
+            if parsed.scheme in {"http", "https"}:
+                qs = parse_qs(parsed.query)
+                if "id" in qs and qs["id"]:
+                    return qs["id"][0]
+        except Exception:
+            pass
+
+        if re.fullmatch(r"[A-Za-z0-9_-]{10,}", s):
+            return s
+
+        return ""
+
+    @staticmethod
+    def _is_http_url(value: str) -> bool:
+        if not value:
+            return False
+        try:
+            u = urlparse(value.strip())
+            return u.scheme in {"http", "https"}
+        except Exception:
+            return False
+
+    @staticmethod
+    def _guess_suffix(url: str, content_type: str) -> str:
+        try:
+            path = urlparse(url).path
+            ext = os.path.splitext(path)[1]
+            if ext and len(ext) <= 6:
+                return ext
+        except Exception:
+            pass
+
+        ct = (content_type or "").split(";")[0].strip().lower()
+        if ct:
+            guess = mimetypes.guess_extension(ct)
+            if guess:
+                return guess
+        return ".jpg"
+
+    def _download_url_to_temp(self, url: str) -> str:
+        last_err = None
+        tries = max(1, int(Config.IMAGE_DOWNLOAD_RETRIES))
+        for attempt in range(1, tries + 1):
+            tmp_path = ""
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=int(Config.IMAGE_DOWNLOAD_TIMEOUT_SECONDS)) as resp:
+                    content_type = resp.headers.get("Content-Type", "")
+                    suffix = self._guess_suffix(url, content_type)
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+                    tmp_path = tmp.name
+                    try:
+                        while True:
+                            chunk = resp.read(1024 * 64)
+                            if not chunk:
+                                break
+                            tmp.write(chunk)
+                    finally:
+                        tmp.close()
+
+                if os.path.getsize(tmp_path) < 1024:
+                    try:
+                        with open(tmp_path, "rb") as f:
+                            head = f.read(512).lower()
+                        if b"<html" in head or b"<!doctype html" in head:
+                            try:
+                                os.unlink(tmp_path)
+                            except Exception:
+                                pass
+                            raise ValueError("Downloaded HTML instead of image")
+                    except Exception:
+                        pass
+
+                return tmp_path
+            except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
+                last_err = e
+                try:
+                    if tmp_path and os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                except Exception:
+                    pass
+                if attempt < tries:
+                    time.sleep(max(1, int(Config.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS)) * attempt)
+                    continue
+                raise
+            except Exception as e:
+                last_err = e
+                try:
+                    if tmp_path and os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                except Exception:
+                    pass
+                raise
+
+        raise last_err if last_err else ValueError("Download failed")
+
+    def _download_drive_file_to_temp(self, file_id: str) -> str:
+        if not file_id:
+            raise ValueError("Missing Drive file id")
+
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+
+        last_err = None
+        tries = max(1, int(Config.IMAGE_DOWNLOAD_RETRIES))
+        for attempt in range(1, tries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=int(Config.IMAGE_DOWNLOAD_TIMEOUT_SECONDS)) as resp:
+                    content_type = resp.headers.get("Content-Type", "")
+
+                    if (content_type or "").lower().startswith("text/html"):
+                        html = resp.read(1024 * 1024).decode("utf-8", errors="ignore")
+                        token_match = re.search(r"confirm=([0-9A-Za-z_]+)", html)
+                        token = token_match.group(1) if token_match else ""
+
+                        cookie = resp.headers.get("Set-Cookie", "")
+                        if token:
+                            url2 = f"https://drive.google.com/uc?export=download&confirm={token}&id={file_id}"
+                            headers = {"User-Agent": "Mozilla/5.0"}
+                            if cookie:
+                                headers["Cookie"] = cookie
+                            req2 = urllib.request.Request(url2, headers=headers)
+                            return self._download_url_to_temp(req2.full_url)
+
+                        raise ValueError("Drive download returned HTML")
+
+                return self._download_url_to_temp(url)
+
+            except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
+                last_err = e
+                if attempt < tries:
+                    time.sleep(max(1, int(Config.IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS)) * attempt)
+                    continue
+                raise
+
+        raise last_err if last_err else ValueError("Drive download failed")
+
+    def _resolve_image_to_local_path(self, image_path: str) -> (str, bool):
+        p = (image_path or "").strip()
+        if not p:
+            return "", False
+
+        if os.path.exists(p):
+            return os.path.abspath(p), False
+
+        drive_id = self._extract_drive_file_id(p)
+        if drive_id and ("drive.google.com" in p or "/file/d/" in p or p == drive_id):
+            tmp_path = self._download_drive_file_to_temp(drive_id)
+            return tmp_path, True
+
+        if self._is_http_url(p):
+            tmp_path = self._download_url_to_temp(p)
+            return tmp_path, True
+
+        return p, False
 
     def _select_radio_option(
         self,
@@ -1107,6 +1436,7 @@ class PostCreator:
                 # Tags if available
                 if tags:
                     try:
+                        tags = self._sanitize_tags(tags)
                         tags_input = form.find_element(
                             By.CSS_SELECTOR,
                             "input[name='tags'], #id_tags"
@@ -1129,6 +1459,10 @@ class PostCreator:
                 # Get result URL
                 post_url = self._extract_post_url()
 
+                if self._is_denied_or_share_url(post_url):
+                    self.logger.error(f"Text post denied (url={post_url})")
+                    return {"status": "Denied", "url": post_url}
+
                 if "damadam.pk" in post_url and "/comments/text/" in post_url:
                     self.logger.success(f"Text post created: {post_url}")
                     return {"status": "Posted", "url": post_url}
@@ -1149,10 +1483,27 @@ class PostCreator:
         try:
             self.logger.info("Creating image post...")
 
+            temp_file = ""
+            is_temp = False
+            try:
+                resolved_path, is_temp = self._resolve_image_to_local_path(image_path)
+                if is_temp:
+                    temp_file = resolved_path
+                image_path = resolved_path
+            except Exception as e:
+                self.logger.error(f"Image download failed: {e}")
+                return {"status": "Image Download Failed", "url": ""}
+
             # Verify file exists
             if not os.path.exists(image_path):
                 self.logger.error(f"Image not found: {image_path}")
                 return {"status": "File Not Found", "url": ""}
+
+            try:
+                size_mb = os.path.getsize(image_path) / (1024 * 1024)
+                self.logger.debug(f"Image size: {size_mb:.2f} MB")
+            except Exception:
+                pass
 
             self.logger.debug(f"Image: {image_path}")
             self.driver.get(f"{Config.BASE_URL}/share/photo/upload/")
@@ -1174,9 +1525,16 @@ class PostCreator:
                 abs_path = os.path.abspath(image_path)
                 file_input.send_keys(abs_path)
                 self.logger.debug("Image uploaded")
+                try:
+                    WebDriverWait(self.driver, 15).until(
+                        lambda d: bool((file_input.get_attribute("value") or "").strip())
+                    )
+                except Exception:
+                    pass
                 time.sleep(2)
 
                 caption = content or title
+                caption = self._sanitize_caption(caption)
                 if caption:
                     try:
                         caption_area = form.find_element(By.CSS_SELECTOR, "textarea")
@@ -1242,6 +1600,10 @@ class PostCreator:
                 # Get result URL
                 post_url = self._extract_post_url()
 
+                if self._is_denied_or_share_url(post_url):
+                    self.logger.error(f"Image post denied (url={post_url})")
+                    return {"status": "Denied", "url": post_url}
+
                 if "damadam.pk" in post_url and ("/comments/image/" in post_url or "/content/" in post_url):
                     self.logger.success(f"Image post created: {post_url}")
                     return {"status": "Posted", "url": post_url}
@@ -1256,6 +1618,13 @@ class PostCreator:
         except Exception as e:
             self.logger.error(f"Image post error: {e}")
             return {"status": f"Error: {str(e)[:50]}", "url": ""}
+
+        finally:
+            try:
+                if 'temp_file' in locals() and temp_file and os.path.exists(temp_file):
+                    os.unlink(temp_file)
+            except Exception:
+                pass
 
 # ============================================================================
 # INBOX MONITOR
@@ -1455,6 +1824,11 @@ def run_message_mode(args):
             return
         logger.success("✅ Sheets connected\n")
 
+        activity = ActivityLogger(sheets_mgr, logger)
+        activity.initialize()
+        conv_logger = ConversationLogger(sheets_mgr, logger)
+        conv_logger.initialize()
+
         # Initialize components
         scraper = ProfileScraper(driver, logger)
         recorder = MessageRecorder(sheets_mgr, logger)
@@ -1474,34 +1848,51 @@ def run_message_mode(args):
         all_rows = msglist.get_all_values()
 
         pending = []
+        pending_status_rows = 0
+        pending_missing_message = 0
+        pending_missing_nick = 0
         for i, row in enumerate(all_rows[1:], start=2):
-            if len(row) >= 8:
-                mode = row[0].strip().lower()
-                name = row[1].strip()
-                nick_or_url = row[2].strip()
-                city = row[3].strip() if len(row) > 3 else ""
-                posts = row[4].strip() if len(row) > 4 else ""
-                followers = row[5].strip() if len(row) > 5 else ""
-                message = row[6].strip()
-                status = row[7].strip().lower()
-                notes = row[8].strip() if len(row) > 8 else ""
+            cols = list(row) + [""] * (10 - len(row))
+            mode = (cols[0] or "").strip().lower()
+            name = (cols[1] or "").strip()
+            nick_or_url = (cols[2] or "").strip()
+            city = (cols[3] or "").strip()
+            posts = (cols[4] or "").strip()
+            followers = (cols[5] or "").strip()
+            message = (cols[6] or "").strip()
+            status = (cols[7] or "").strip().lower()
+            notes = (cols[8] or "").strip()
 
-                if nick_or_url and message and status.startswith("pending"):
-                    pending.append({
-                        "row": i,
-                        "mode": mode,
-                        "name": name,
-                        "nick_or_url": nick_or_url,
-                        "city": city,
-                        "posts": posts,
-                        "followers": followers,
-                        "message": message,
-                        "notes": notes
-                    })
+            if status.startswith("pending"):
+                pending_status_rows += 1
+                if not nick_or_url:
+                    pending_missing_nick += 1
+                    continue
+                if not message:
+                    pending_missing_message += 1
+                    continue
+
+                pending.append({
+                    "row": i,
+                    "mode": mode,
+                    "name": name,
+                    "nick_or_url": nick_or_url,
+                    "city": city,
+                    "posts": posts,
+                    "followers": followers,
+                    "message": message,
+                    "notes": notes
+                })
 
         if not pending:
             logger.warning("⚠️ No pending targets found in MsgList")
-            logger.info("Add targets with STATUS='pending' in MsgList sheet")
+            if pending_status_rows:
+                logger.info(
+                    f"Found {pending_status_rows} rows with STATUS='pending' but none were runnable "
+                    f"(missing NICK/URL={pending_missing_nick}, missing MESSAGE={pending_missing_message})"
+                )
+            else:
+                logger.info("Add targets with STATUS='pending' in MsgList sheet")
             return
 
         # Apply max limit
@@ -1556,6 +1947,17 @@ def run_message_mode(args):
                         logger.error("❌ Profile scrape failed")
                         sheets_mgr.update_cell(msglist, row_num, 8, "Failed")
                         sheets_mgr.update_cell(msglist, row_num, 9, "Profile scrape failed")
+                        try:
+                            activity.log(
+                                mode="msg",
+                                action="profile_scrape_failed",
+                                nick=nick_or_url,
+                                url="",
+                                status="Failed",
+                                details="Profile scrape failed"
+                            )
+                        except Exception:
+                            pass
                         failed_count += 1
                         continue
 
@@ -1564,6 +1966,17 @@ def run_message_mode(args):
                         logger.warning("⚠️ Account suspended")
                         sheets_mgr.update_cell(msglist, row_num, 8, "Skipped")
                         sheets_mgr.update_cell(msglist, row_num, 9, "Account suspended")
+                        try:
+                            activity.log(
+                                mode="msg",
+                                action="account_suspended",
+                                nick=profile.get("NICK", nick_or_url),
+                                url="",
+                                status="Skipped",
+                                details="Account suspended"
+                            )
+                        except Exception:
+                            pass
                         failed_count += 1
                         continue
 
@@ -1581,6 +1994,17 @@ def run_message_mode(args):
                         logger.warning("⚠️ No posts available")
                         sheets_mgr.update_cell(msglist, row_num, 8, "Skipped")
                         sheets_mgr.update_cell(msglist, row_num, 9, "No posts")
+                        try:
+                            activity.log(
+                                mode="msg",
+                                action="no_posts",
+                                nick=profile.get("NICK", nick_or_url),
+                                url="",
+                                status="Skipped",
+                                details="No posts"
+                            )
+                        except Exception:
+                            pass
                         failed_count += 1
                         continue
 
@@ -1599,6 +2023,18 @@ def run_message_mode(args):
                             f"No open posts found (scanned up to {max_pages} pages)"
                         )
 
+                        try:
+                            activity.log(
+                                mode="msg",
+                                action="no_open_posts",
+                                nick=profile.get("NICK", nick_or_url),
+                                url="",
+                                status="Failed",
+                                details=f"scanned_pages={max_pages}"
+                            )
+                        except Exception:
+                            pass
+
                         failed_count += 1
                         continue
 
@@ -1608,6 +2044,33 @@ def run_message_mode(args):
 
                 # Send message
                 result = sender.send_message(post_url, processed_msg, nick_or_url)
+
+                try:
+                    nick_for_logs = ""
+                    if isinstance(profile, dict):
+                        nick_for_logs = (profile.get("NICK") or "").strip()
+                    if not nick_for_logs:
+                        nick_for_logs = nick_or_url
+
+                    base_url = ProfileScraper.clean_url(post_url or "")
+                    activity.log(
+                        mode="msg",
+                        action="send_message",
+                        nick=nick_for_logs,
+                        url=base_url,
+                        status=result.get("status", ""),
+                        details=f"target_mode={mode}; result_url={ProfileScraper.clean_url(result.get('url',''))}"
+                    )
+                    conv_logger.log(
+                        nick=nick_for_logs,
+                        direction="OUT",
+                        mode="msg",
+                        message=processed_msg,
+                        url=base_url,
+                        status=result.get("status", "")
+                    )
+                except Exception:
+                    pass
 
                 # Update sheet based on result
                 timestamp = datetime.now().strftime("%I:%M %p")
@@ -1645,6 +2108,18 @@ def run_message_mode(args):
                 sheets_mgr.update_cell(msglist, target["row"], 9, error_msg)
                 failed_count += 1
 
+                try:
+                    activity.log(
+                        mode="msg",
+                        action="exception",
+                        nick=target.get("nick_or_url", ""),
+                        url="",
+                        status="Exception",
+                        details=error_msg
+                    )
+                except Exception:
+                    pass
+
         # Summary
         logger.info("\n" + "=" * 70)
         logger.info("📊 MESSAGE MODE SUMMARY")
@@ -1669,9 +2144,18 @@ def run_message_mode(args):
 def run_post_mode(args):
     """Phase 2: Create new posts (text/image)"""
     logger = Logger("post")
-    logger.info("=" * 70)
-    logger.info(f"DamaDam Bot V{VERSION} - POST MODE")
-    logger.info("=" * 70 + "\n")
+    try:
+        console.print(
+            Panel.fit(
+                f"DamaDam Bot V{VERSION} - POST MODE",
+                title="POST",
+                border_style="cyan",
+            )
+        )
+    except Exception:
+        logger.info("=" * 70)
+        logger.info(f"DamaDam Bot V{VERSION} - POST MODE")
+        logger.info("=" * 70 + "\n")
 
     browser_mgr = BrowserManager(logger)
     driver = browser_mgr.setup()
@@ -1686,6 +2170,9 @@ def run_post_mode(args):
         if not sheets_mgr.connect():
             return
 
+        activity = ActivityLogger(sheets_mgr, logger)
+        activity.initialize()
+
         creator = PostCreator(driver, logger)
         post_queue = sheets_mgr.get_sheet(Config.SHEET_ID, "PostQueue")
         if not post_queue:
@@ -1695,25 +2182,89 @@ def run_post_mode(args):
         sheets_mgr.api_calls += 1
         all_rows = post_queue.get_all_values()
 
+        headers = all_rows[0] if all_rows else []
+        header_map: Dict[str, int] = {}
+        for idx, h in enumerate(headers):
+            key = (h or "").strip().upper()
+            if key and key not in header_map:
+                header_map[key] = idx
+
+        use_headers = bool(header_map)
+
+        def get_cell(row: List[str], key: str) -> str:
+            if not use_headers:
+                return ""
+            if key not in header_map:
+                return ""
+            j = header_map[key]
+            if j < 0 or j >= len(row):
+                return ""
+            return (row[j] or "").strip()
+
+        def get_legacy(row: List[str], idx: int) -> str:
+            if idx < 0 or idx >= len(row):
+                return ""
+            return (row[idx] or "").strip()
+
+        if header_map:
+            col_status = header_map.get("STATUS", 5) + 1
+            col_post_url = header_map.get("POST_URL", 6) + 1
+            col_timestamp = header_map.get("TIMESTAMP", 7) + 1
+            col_notes = header_map.get("NOTES", 8) + 1
+        else:
+            # Fallback to legacy layout if headers are missing
+            col_status = 6
+            col_post_url = 7
+            col_timestamp = 8
+            col_notes = 9
+
         pending = []
         for i, row in enumerate(all_rows[1:], start=2):
-            if len(row) >= 6:
-                post_type = row[0].strip().lower()
-                title = row[1].strip()
-                content = row[2].strip()
-                image_path = row[3].strip()
-                tags = row[4].strip()
-                status = row[5].strip().lower()
+            if use_headers:
+                post_type = get_cell(row, "TYPE").lower()
+                status = get_cell(row, "STATUS").lower()
+                title = get_cell(row, "TITLE")
+                content = get_cell(row, "CONTENT")
+                image_path = get_cell(row, "IMAGE_PATH")
+                tags = get_cell(row, "TAGS")
+                notes_val = get_cell(row, "NOTES")
+            else:
+                # Legacy layout: TYPE, TITLE, CONTENT, IMAGE_PATH, TAGS, STATUS, ...
+                post_type = get_legacy(row, 0).lower()
+                title = get_legacy(row, 1)
+                content = get_legacy(row, 2)
+                image_path = get_legacy(row, 3)
+                tags = get_legacy(row, 4)
+                status = get_legacy(row, 5).lower()
+                notes_val = get_legacy(row, 8)
 
-                if status.startswith("pending"):
-                    pending.append({
-                        "row": i,
-                        "type": post_type,
-                        "title": title,
-                        "content": content,
-                        "image_path": image_path,
-                        "tags": tags
-                    })
+            if not post_type:
+                continue
+
+            should_run = status.startswith("pending")
+            attempt_num = 1
+            if not should_run and Config.POST_RETRY_FAILED and status.startswith("failed"):
+                try:
+                    m = re.search(r"attempt\s*(\d+)", (notes_val or "").lower())
+                    if m:
+                        attempt_num = int(m.group(1)) + 1
+                except Exception:
+                    attempt_num = 1
+                if attempt_num <= max(1, Config.POST_MAX_ATTEMPTS):
+                    should_run = True
+
+            if not should_run:
+                continue
+
+            pending.append({
+                "row": i,
+                "type": post_type,
+                "title": title,
+                "content": content,
+                "image_path": image_path,
+                "tags": tags,
+                "attempt": attempt_num
+            })
 
         if not pending:
             logger.warning("No pending posts in PostQueue")
@@ -1727,59 +2278,196 @@ def run_post_mode(args):
         success = 0
         failed = 0
 
-        for idx, post in enumerate(pending, 1):
-            logger.info(f"\n[{idx}/{len(pending)}] 📝 {post['type'].upper()}: {post['title'] or 'Untitled'}")
-            logger.info("─" * 50)
-
+        def cooldown_wait(seconds: int):
+            if seconds <= 0:
+                return
             try:
-                result = None
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("{task.description}"),
+                    BarColumn(),
+                    TimeElapsedColumn(),
+                    console=console,
+                ) as cd:
+                    t = cd.add_task(f"Cooldown {seconds}s", total=seconds)
+                    for _ in range(seconds):
+                        time.sleep(1)
+                        cd.advance(t, 1)
+            except Exception:
+                time.sleep(seconds)
 
-                if post["type"] == "text":
-                    result = creator.create_text_post(
-                        title=post["title"],
-                        content=post["content"],
-                        tags=post["tags"]
-                    )
-                elif post["type"] == "image":
-                    result = creator.create_image_post(
-                        image_path=post["image_path"],
-                        title=post["title"],
-                        content=post["content"],
-                        tags=post["tags"]
-                    )
-                else:
-                    logger.error(f"Unknown type: {post['type']}")
-                    sheets_mgr.update_cell(post_queue, post["row"], 6, "Failed")
-                    sheets_mgr.update_cell(post_queue, post["row"], 9, "Invalid type")
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task_id = progress.add_task("Posting", total=len(pending))
+
+            for idx, post in enumerate(pending, 1):
+                title = post.get("title") or "Untitled"
+                progress.update(task_id, description=f"{post['type'].upper()}: {title}")
+                logger.info(f"\n[{idx}/{len(pending)}] 📝 {post['type'].upper()}: {title}")
+                logger.info("─" * 50)
+
+                try:
+                    result = None
+
+                    denied_retries = max(0, int(Config.POST_DENIED_RETRIES))
+                    for denied_try in range(0, denied_retries + 1):
+                        if post["type"] == "text":
+                            result = creator.create_text_post(
+                                title=post["title"],
+                                content=post["content"],
+                                tags=post["tags"]
+                            )
+                        elif post["type"] == "image":
+                            result = creator.create_image_post(
+                                image_path=post["image_path"],
+                                title=post["title"],
+                                content=post["content"],
+                                tags=post["tags"]
+                            )
+                        else:
+                            logger.error(f"Unknown type: {post['type']}")
+                            sheets_mgr.update_cell(post_queue, post["row"], col_status, "Failed")
+                            sheets_mgr.update_cell(post_queue, post["row"], col_notes, "Invalid type")
+                            failed += 1
+                            progress.advance(task_id, 1)
+                            result = None
+                            break
+
+                        if result and (result.get("status") == "Denied"):
+                            denied_url = (result.get("url") or "").strip()
+                            if PostCreator._is_denied_or_share_url(denied_url) and denied_try < denied_retries:
+                                wait_s = max(0, int(Config.POST_DENIED_BACKOFF_SECONDS))
+                                if wait_s > 0:
+                                    logger.warning(
+                                        f"Denied (url={denied_url}). Backing off {wait_s}s then retrying..."
+                                    )
+                                    cooldown_wait(wait_s)
+                                continue
+                        break
+
+                    if post["type"] not in {"text", "image"}:
+                        continue
+
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    attempt_num = int(post.get("attempt") or 1)
+                    if result and "Posted" in result["status"]:
+                        sheets_mgr.update_cell(post_queue, post["row"], col_status, "Done")
+                        sheets_mgr.update_cell(post_queue, post["row"], col_post_url, result["url"])
+                        sheets_mgr.update_cell(post_queue, post["row"], col_timestamp, timestamp)
+                        sheets_mgr.update_cell(post_queue, post["row"], col_notes, result["status"])
+                        success += 1
+
+                        try:
+                            activity.log(
+                                mode="post",
+                                action="create_post",
+                                nick="",
+                                url=result.get("url", ""),
+                                status=result.get("status", ""),
+                                details=f"type={post.get('type','')}"
+                            )
+                        except Exception:
+                            pass
+                    elif result and "Verification" in result.get("status", ""):
+                        result_url = (result.get("url") or "").strip()
+                        is_post_url = ProfileScraper.is_valid_url(result_url)
+                        if (not is_post_url) or PostCreator._is_denied_or_share_url(result_url):
+                            sheets_mgr.update_cell(post_queue, post["row"], col_status, "Failed")
+                            sheets_mgr.update_cell(
+                                post_queue,
+                                post["row"],
+                                col_notes,
+                                f"Attempt {attempt_num}/{Config.POST_MAX_ATTEMPTS} - {result.get('status', 'Error')}"
+                            )
+                            failed += 1
+
+                            try:
+                                activity.log(
+                                    mode="post",
+                                    action="create_post_failed",
+                                    nick="",
+                                    url=result_url,
+                                    status=result.get("status", "Error"),
+                                    details=f"type={post.get('type','')}"
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            sheets_mgr.update_cell(post_queue, post["row"], col_status, "Done")
+                            if result.get("url"):
+                                sheets_mgr.update_cell(post_queue, post["row"], col_post_url, result["url"])
+                            sheets_mgr.update_cell(post_queue, post["row"], col_timestamp, timestamp)
+                            sheets_mgr.update_cell(post_queue, post["row"], col_notes, result["status"])
+                            success += 1
+
+                            try:
+                                activity.log(
+                                    mode="post",
+                                    action="create_post",
+                                    nick="",
+                                    url=result.get("url", ""),
+                                    status=result.get("status", ""),
+                                    details=f"type={post.get('type','')}"
+                                )
+                            except Exception:
+                                pass
+                    else:
+                        sheets_mgr.update_cell(post_queue, post["row"], col_status, "Failed")
+                        sheets_mgr.update_cell(
+                            post_queue,
+                            post["row"],
+                            col_notes,
+                            f"Attempt {attempt_num}/{Config.POST_MAX_ATTEMPTS} - {result.get('status', 'Error')}"
+                        )
+                        failed += 1
+
+                        try:
+                            activity.log(
+                                mode="post",
+                                action="create_post_failed",
+                                nick="",
+                                url=result.get("url", "") if result else "",
+                                status=result.get("status", "Error") if result else "Error",
+                                details=f"type={post.get('type','')}"
+                            )
+                        except Exception:
+                            pass
+
+                    time.sleep(3)
+                    progress.advance(task_id, 1)
+
+                    if idx < len(pending):
+                        s = (result.get("status") if result else "") or ""
+                        if s not in {"Image Download Failed", "File Not Found"}:
+                            cooldown_wait(Config.POST_COOLDOWN_SECONDS)
+
+                except Exception as e:
+                    logger.error(f"Error: {e}")
+                    sheets_mgr.update_cell(post_queue, post["row"], col_status, "Failed")
+                    sheets_mgr.update_cell(post_queue, post["row"], col_notes, str(e)[:50])
                     failed += 1
-                    continue
+                    progress.advance(task_id, 1)
 
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                if result and "Posted" in result["status"]:
-                    sheets_mgr.update_cell(post_queue, post["row"], 6, "Done")
-                    sheets_mgr.update_cell(post_queue, post["row"], 7, result["url"])
-                    sheets_mgr.update_cell(post_queue, post["row"], 8, timestamp)
-                    sheets_mgr.update_cell(post_queue, post["row"], 9, result["status"])
-                    success += 1
-                elif result and "Verification" in result.get("status", ""):
-                    sheets_mgr.update_cell(post_queue, post["row"], 6, "Done")
-                    if result.get("url"):
-                        sheets_mgr.update_cell(post_queue, post["row"], 7, result["url"])
-                    sheets_mgr.update_cell(post_queue, post["row"], 8, timestamp)
-                    sheets_mgr.update_cell(post_queue, post["row"], 9, result["status"])
-                    success += 1
-                else:
-                    sheets_mgr.update_cell(post_queue, post["row"], 6, "Failed")
-                    sheets_mgr.update_cell(post_queue, post["row"], 9, result.get("status", "Error"))
-                    failed += 1
+                    try:
+                        activity.log(
+                            mode="post",
+                            action="exception",
+                            nick="",
+                            url="",
+                            status="Exception",
+                            details=str(e)[:500]
+                        )
+                    except Exception:
+                        pass
 
-                time.sleep(3)
-
-            except Exception as e:
-                logger.error(f"Error: {e}")
-                sheets_mgr.update_cell(post_queue, post["row"], 6, "Failed")
-                sheets_mgr.update_cell(post_queue, post["row"], 9, str(e)[:50])
-                failed += 1
+                    if idx < len(pending):
+                        cooldown_wait(Config.POST_COOLDOWN_SECONDS)
 
         logger.info("\n" + "=" * 70)
         logger.success(f"✅ Success: {success}/{len(pending)}")
@@ -1813,8 +2501,20 @@ def run_inbox_mode(args):
         if not sheets_mgr.connect():
             return
 
+        activity = ActivityLogger(sheets_mgr, logger)
+        activity.initialize()
+        conv_logger = ConversationLogger(sheets_mgr, logger)
+        conv_logger.initialize()
+
         monitor = InboxMonitor(driver, logger)
-        inbox_queue = sheets_mgr.get_sheet(Config.SHEET_ID, "InboxQueue")
+
+        inbox_queue = sheets_mgr.get_sheet(Config.SHEET_ID, "Inbox", create_if_missing=False)
+        if not inbox_queue:
+            inbox_queue = sheets_mgr.get_sheet(Config.SHEET_ID, "InboxQueue", create_if_missing=False)
+        if not inbox_queue:
+            inbox_queue = sheets_mgr.get_sheet(Config.SHEET_ID, "Inbox & Activity", create_if_missing=False)
+        if not inbox_queue:
+            inbox_queue = sheets_mgr.get_sheet(Config.SHEET_ID, "Inbox")
         if not inbox_queue:
             return
 
@@ -1825,6 +2525,11 @@ def run_inbox_mode(args):
         sheets_mgr.api_calls += 1
         existing_rows = inbox_queue.get_all_values()
         existing_nicks = {row[0].strip().lower() for row in existing_rows[1:] if row}
+        existing_last_msg = {
+            (row[0].strip().lower()): (row[2].strip() if len(row) > 2 else "")
+            for row in existing_rows[1:]
+            if row and row[0].strip()
+        }
 
         new_count = 0
         for msg in inbox_messages:
@@ -1836,6 +2541,42 @@ def run_inbox_mode(args):
                 sheets_mgr.append_row(inbox_queue, values)
                 logger.info(f"➕ New: {msg['nick']}")
                 new_count += 1
+
+                try:
+                    activity.log(
+                        mode="inbox",
+                        action="new_conversation",
+                        nick=msg.get("nick", ""),
+                        url=msg.get("conv_url", ""),
+                        status="pending",
+                        details=(msg.get("last_msg", "") or "")[:500]
+                    )
+                except Exception:
+                    pass
+
+            try:
+                nick_key = (msg.get("nick") or "").strip().lower()
+                last_now = (msg.get("last_msg") or "").strip()
+                last_prev = (existing_last_msg.get(nick_key) or "").strip()
+                if nick_key and last_now and last_now != last_prev:
+                    conv_logger.log(
+                        nick=msg.get("nick", ""),
+                        direction="IN",
+                        mode="inbox",
+                        message=last_now,
+                        url=msg.get("conv_url", ""),
+                        status="received"
+                    )
+                    activity.log(
+                        mode="inbox",
+                        action="inbound_message",
+                        nick=msg.get("nick", ""),
+                        url=msg.get("conv_url", ""),
+                        status="received",
+                        details=last_now[:500]
+                    )
+            except Exception:
+                pass
 
         if new_count:
             logger.success(f"Added {new_count} new conversations\n")
@@ -1881,6 +2622,26 @@ def run_inbox_mode(args):
                         sheets_mgr.update_cell(inbox_queue, reply["row"], 8, conv_log)
                     success += 1
 
+                    try:
+                        activity.log(
+                            mode="inbox",
+                            action="send_reply",
+                            nick=reply.get("nick", ""),
+                            url=conv_url,
+                            status="sent",
+                            details=(reply.get("reply", "") or "")[:500]
+                        )
+                        conv_logger.log(
+                            nick=reply.get("nick", ""),
+                            direction="OUT",
+                            mode="inbox",
+                            message=reply.get("reply", ""),
+                            url=conv_url,
+                            status="sent"
+                        )
+                    except Exception:
+                        pass
+
                 time.sleep(2)
             except Exception as e:
                 logger.error(f"Error: {e}")
@@ -1898,8 +2659,11 @@ def run_inbox_mode(args):
 
 def main():
     try:
+        import logging
         from dotenv import load_dotenv
-        load_dotenv()
+        logging.getLogger("dotenv").setLevel(logging.ERROR)
+        logging.getLogger("dotenv.main").setLevel(logging.ERROR)
+        load_dotenv(override=False)
     except Exception:
         pass
 
